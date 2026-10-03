@@ -50,6 +50,8 @@ class Node:
     edit_text: str  # texte proposé lors de l'édition
     is_container: bool
     editable: bool
+    renamable: bool = False  # la clé peut-elle être modifiée ?
+    key_edit_text: str = ""  # texte proposé lors du renommage de la clé
 
 
 def parse_literal(text: str) -> Any:
@@ -92,7 +94,12 @@ class ObjectAdapter(ABC):
     def requires_key(self, obj: Any, path: Path) -> bool:
         return False
 
-    def add_item(self, obj: Any, path: Path, key: str | None, raw: str) -> None:
+    def rename_key(self, obj: Any, path: Path, raw: str) -> Path:
+        """Renomme la clé située à ``path`` et retourne le nouveau chemin."""
+        raise NotImplementedError("Renommage non supporté pour ce type.")
+
+    def add_item(self, obj: Any, path: Path, key: str | None, raw: str) -> Path:
+        """Ajoute un élément dans le conteneur ``path`` et retourne son chemin."""
         raise NotImplementedError("Ajout non supporté pour ce type.")
 
     def delete_item(self, obj: Any, path: Path) -> None:
@@ -154,6 +161,7 @@ class DictAdapter(ObjectAdapter):
 
     def children(self, obj: Any, path: Path) -> list[Node]:
         container = self._resolve(obj, path)
+        in_dict = isinstance(container, dict)
         nodes = []
         for key, value in self._items(container):
             is_container = isinstance(value, (dict, list))
@@ -167,6 +175,8 @@ class DictAdapter(ObjectAdapter):
                     edit_text=repr(value),
                     is_container=is_container,
                     editable=not is_container,
+                    renamable=in_dict,
+                    key_edit_text=key if isinstance(key, str) else repr(key),
                 )
             )
         return nodes
@@ -183,7 +193,36 @@ class DictAdapter(ObjectAdapter):
     def requires_key(self, obj: Any, path: Path) -> bool:
         return isinstance(self._resolve(obj, path), dict)
 
-    def add_item(self, obj: Any, path: Path, key: str | None, raw: str) -> None:
+    def rename_key(self, obj: Any, path: Path, raw: str) -> Path:
+        """Renomme une clé de dict en conservant l'ordre des éléments.
+
+        Une clé ``str`` reste une ``str`` (le texte saisi est pris tel quel) ;
+        une clé d'un autre type (int, tuple…) est interprétée par ``parse_literal``.
+        """
+        if not path:
+            raise ValueError("Le nœud racine ne peut pas être renommé.")
+        parent = self._resolve(obj, path[:-1])
+        if not isinstance(parent, dict):
+            raise TypeError("Seules les clés d'un dict peuvent être renommées.")
+        old_key = path[-1]
+        new_key = raw if isinstance(old_key, str) else parse_literal(raw)
+        if new_key == "":
+            raise ValueError("La clé ne peut pas être vide.")
+        try:
+            hash(new_key)
+        except TypeError:
+            raise TypeError(f"{new_key!r} ne peut pas servir de clé (non hachable).") from None
+        if new_key == old_key:
+            return path
+        if new_key in parent:
+            raise ValueError(f"La clé {new_key!r} existe déjà.")
+        items = list(parent.items())
+        parent.clear()
+        for key, value in items:
+            parent[new_key if key == old_key else key] = value
+        return path[:-1] + (new_key,)
+
+    def add_item(self, obj: Any, path: Path, key: str | None, raw: str) -> Path:
         container = self._resolve(obj, path)
         value = parse_literal(raw)
         if isinstance(container, dict):
@@ -193,8 +232,9 @@ class DictAdapter(ObjectAdapter):
             if parsed_key in container:
                 raise KeyError(f"La clé {parsed_key!r} existe déjà.")
             container[parsed_key] = value
-        else:
-            container.append(value)
+            return path + (parsed_key,)
+        container.append(value)
+        return path + (len(container) - 1,)
 
     def delete_item(self, obj: Any, path: Path) -> None:
         if not path:
@@ -217,6 +257,20 @@ class DictAdapter(ObjectAdapter):
 # ---------------------------------------------------------------------------
 # Interface graphique
 # ---------------------------------------------------------------------------
+KEY_COLUMN = "#0"
+VALUE_COLUMN = "#1"
+
+
+@dataclass
+class _InlineEditor:
+    """Champ de saisie superposé à une cellule du Treeview."""
+
+    entry: ttk.Entry
+    iid: str
+    column: str  # KEY_COLUMN ou VALUE_COLUMN
+    node: Node
+
+
 class ObjectEditorApp(tk.Tk):
     """Fenêtre d'édition générique, pilotée par un ``ObjectAdapter``."""
 
@@ -242,6 +296,7 @@ class ObjectEditorApp(tk.Tk):
     }
     DEFAULT_CONTAINER_BACKGROUND = "#f0f0f0"
     SELECTION_BACKGROUND = "#3a6ea5"
+    ICON_SIZE = 12
 
     def __init__(
         self,
@@ -263,6 +318,7 @@ class ObjectEditorApp(tk.Tk):
         self._nodes: dict[str, Node] = {}
         self._icons: dict[str, tk.PhotoImage] = {}  # références à conserver (sinon GC)
         self._styled_tags: set[str] = set()
+        self._editor: _InlineEditor | None = None
 
         self._build_menu()
         self._build_tree()
@@ -312,13 +368,18 @@ class ObjectEditorApp(tk.Tk):
         self.tree.column("value", width=380)
         self.tree.column("type", width=90, stretch=False)
 
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
+        self._scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=self._on_tree_scroll)
         self.tree.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        self._scrollbar.pack(side="right", fill="y")
 
-        self.tree.bind("<Double-1>", lambda _e: self._on_edit())
-        self.tree.bind("<Return>", lambda _e: self._on_edit())
+        self.tree.bind("<Double-1>", self._on_double_click)
+        self.tree.bind("<Button-1>", lambda _e: self._finish_edit(commit=True), add=True)
+        self.tree.bind("<Configure>", lambda _e: self._place_editor(), add=True)
+        self.tree.bind("<Return>", lambda _e: self._edit_selected(VALUE_COLUMN))
+        self.tree.bind("<F2>", lambda _e: self._edit_selected(KEY_COLUMN))
+        self.tree.bind("<Tab>", lambda _e: self._tab_from_tree(+1))
+        self.tree.bind("<Shift-Tab>", lambda _e: self._tab_from_tree(-1))
         self.tree.bind("<Delete>", lambda _e: self._on_delete())
 
     def _build_buttons(self) -> None:
@@ -331,12 +392,34 @@ class ObjectEditorApp(tk.Tk):
         ttk.Button(bar, text="Annuler", command=self._on_cancel).pack(side="right", padx=4)
 
     # -- affichage --------------------------------------------------------
-    def refresh(self, expand_all: bool = False) -> None:
-        """Reconstruit l'arbre en conservant les nœuds ouverts."""
+    def refresh(
+        self,
+        expand_all: bool = False,
+        select: Path | None = None,
+        moved: tuple[Path, Path] | None = None,
+    ) -> None:
+        """Reconstruit l'arbre en conservant les nœuds ouverts et la sélection.
+
+        ``select`` : chemin à sélectionner (par défaut, la sélection courante).
+        ``moved`` : (ancien, nouveau) chemin d'un nœud renommé, pour que lui et
+        ses descendants restent ouverts.
+        """
+        self._finish_edit(commit=False)
+        current = self._selected()
+        if select is None and current is not None:
+            select = current.path
         expanded = {self._nodes[i].path for i in self._walk("") if self.tree.item(i, "open")}
+        if moved is not None:
+            old, new = moved
+            expanded = {new + p[len(old):] if p[: len(old)] == old else p for p in expanded}
         self.tree.delete(*self.tree.get_children())
         self._nodes.clear()
         self._populate("", (), expanded, expand_all)
+        iid = self._iid_for(select) if select is not None else None
+        if iid is not None:
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+            self.tree.see(iid)
 
     def _populate(self, parent_iid: str, path: Path, expanded: set[Path], expand_all: bool) -> None:
         for node in self.adapter.children(self.obj, path):
@@ -357,8 +440,9 @@ class ObjectEditorApp(tk.Tk):
         """Pastille carrée de la couleur du type (créée une seule fois)."""
         if type_name not in self._icons:
             color = self.TYPE_COLORS.get(type_name, self.DEFAULT_TYPE_COLOR)
-            icon = tk.PhotoImage(width=12, height=12)
-            icon.put(color, to=(2, 2, 11, 11))
+            size = self.ICON_SIZE
+            icon = tk.PhotoImage(width=size, height=size)
+            icon.put(color, to=(2, 2, size - 1, size - 1))
             self._icons[type_name] = icon
         return self._icons[type_name]
 
@@ -395,31 +479,232 @@ class ObjectEditorApp(tk.Tk):
         selection = self.tree.selection()
         return self._nodes.get(selection[0]) if selection else None
 
+    def _iid_for(self, path: Path) -> str | None:
+        return next((iid for iid, node in self._nodes.items() if node.path == path), None)
+
+    # -- édition en place -------------------------------------------------
+    def _on_double_click(self, event: tk.Event) -> str | None:
+        iid = self.tree.identify_row(event.y)
+        if not iid or self.tree.identify_region(event.x, event.y) not in ("tree", "cell"):
+            return None
+        column = KEY_COLUMN if self.tree.identify_column(event.x) == KEY_COLUMN else VALUE_COLUMN
+        # "break" empêche le double-clic d'ouvrir/fermer le nœud en plus.
+        return "break" if self._start_edit(iid, column) else None
+
+    def _edit_selected(self, column: str) -> str:
+        selection = self.tree.selection()
+        if selection:
+            self._start_edit(selection[0], column)
+        return "break"
+
+    def _start_edit(self, iid: str, column: str, text: str | None = None) -> bool:
+        """Ouvre un champ de saisie sur la cellule ; False si non éditable."""
+        node = self._nodes.get(iid)
+        if node is None:
+            return False
+        if self._editor is not None:
+            # Valider la saisie en cours reconstruit l'arbre : les iid changent.
+            self._finish_edit(commit=True)
+            if self._editor is not None:  # saisie refusée, rouverte pour correction
+                return False
+            iid = self._iid_for(node.path)
+            node = self._nodes.get(iid) if iid is not None else None
+            if node is None:
+                return False
+        if column == KEY_COLUMN and node.renamable:
+            initial = node.key_edit_text
+        elif column == VALUE_COLUMN and node.editable:
+            initial = node.edit_text
+        else:
+            return False
+
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        self.tree.see(iid)
+        entry = ttk.Entry(self.tree)
+        entry.insert(0, initial if text is None else text)
+        entry.select_range(0, "end")
+        entry.icursor("end")
+        entry.bind("<Return>", lambda _e: self._close_edit(commit=True))
+        entry.bind("<KP_Enter>", lambda _e: self._close_edit(commit=True))
+        entry.bind("<Escape>", lambda _e: self._close_edit(commit=False))
+        entry.bind("<Tab>", lambda _e: self._move_edit(+1))
+        entry.bind("<Shift-Tab>", lambda _e: self._move_edit(-1))
+        entry.bind("<Down>", lambda _e: self._move_edit(+1, same_column=True))
+        entry.bind("<Up>", lambda _e: self._move_edit(-1, same_column=True))
+        entry.bind("<FocusOut>", lambda _e: self.after_idle(self._on_editor_focus_out))
+        self._editor = _InlineEditor(entry, iid, column, node)
+        self.update_idletasks()  # bbox n'est fiable qu'une fois l'arbre affiché
+        self._place_editor()
+        entry.focus_set()
+        return True
+
+    def _place_editor(self) -> None:
+        """(Re)positionne le champ sur sa cellule (après défilement, redimensionnement…)."""
+        editor = self._editor
+        if editor is None:
+            return
+        bbox = self.tree.bbox(editor.iid, editor.column)
+        if not bbox:  # cellule hors de la zone visible
+            editor.entry.place_forget()
+            return
+        x, y, width, height = bbox
+        if editor.column == KEY_COLUMN:
+            # bbox tient déjà compte de la profondeur ; on saute l'indicateur et la pastille.
+            offset = self._indent() + self.ICON_SIZE
+            x, width = x + offset, max(width - offset, 40)
+        editor.entry.place(x=x, y=y, width=width, height=height)
+
+    def _indent(self) -> int:
+        try:
+            return int(ttk.Style(self).lookup("Treeview", "indent") or 20)
+        except (ValueError, tk.TclError):
+            return 20
+
+    def _on_tree_scroll(self, first: str, last: str) -> None:
+        self._scrollbar.set(first, last)
+        self._place_editor()
+
+    def _on_editor_focus_out(self) -> None:
+        editor = self._editor
+        if editor is None:
+            return
+        try:
+            focused = self.focus_get()
+        except KeyError:  # widget interne de Tk (menu déroulant…)
+            focused = None
+        # Fenêtre inactive (Alt+Tab…) : on garde la saisie en cours.
+        if focused is not None and focused is not editor.entry:
+            self._finish_edit(commit=True)
+
+    def _finish_edit(self, commit: bool) -> Path | None:
+        """Ferme le champ de saisie, en appliquant ou non la valeur saisie.
+
+        Retourne le chemin du nœud édité (nouveau chemin s'il a été renommé),
+        ou None si aucun champ n'était ouvert ou si la saisie a été refusée.
+        """
+        editor, self._editor = self._editor, None
+        if editor is None:
+            return None
+        raw = editor.entry.get()
+        editor.entry.destroy()
+        self.tree.focus_set()
+        node = editor.node
+        initial = node.key_edit_text if editor.column == KEY_COLUMN else node.edit_text
+        if not commit or raw == initial:
+            return node.path
+        if editor.column == KEY_COLUMN:
+            ok = self._mutate(
+                lambda: self.adapter.rename_key(self.obj, node.path, raw), origin=node.path
+            )
+        else:
+            ok = self._mutate(lambda: self.adapter.set_value(self.obj, node.path, raw))
+        if ok:
+            selected = self._selected()  # _mutate sélectionne le nœud (éventuellement renommé)
+            return selected.path if selected is not None else node.path
+        # Saisie refusée : on rouvre le champ pour correction.
+        iid = self._iid_for(node.path)
+        if iid is not None:
+            self._start_edit(iid, editor.column, text=raw)
+        return None
+
+    def _close_edit(self, commit: bool) -> str:
+        """Gestionnaire clavier (Entrée / Échap) : ferme le champ sans propager l'événement."""
+        self._finish_edit(commit)
+        return "break"
+
+    # -- navigation clavier entre cellules -------------------------------
+    def _walk_visible(self, parent_iid: str):
+        """Lignes affichées, dans l'ordre (les enfants des nœuds fermés sont ignorés)."""
+        for iid in self.tree.get_children(parent_iid):
+            yield iid
+            if self.tree.item(iid, "open"):
+                yield from self._walk_visible(iid)
+
+    def _editable_cells(self) -> list[tuple[str, str]]:
+        """Cellules éditables visibles, dans l'ordre de lecture : (iid, colonne)."""
+        cells = []
+        for iid in self._walk_visible(""):
+            node = self._nodes[iid]
+            if node.renamable:
+                cells.append((iid, KEY_COLUMN))
+            if node.editable:
+                cells.append((iid, VALUE_COLUMN))
+        return cells
+
+    def _move_edit(self, step: int, same_column: bool = False) -> str:
+        """Valide la saisie puis ouvre la cellule voisine.
+
+        ``step`` : +1 (suivante) ou -1 (précédente). Avec ``same_column``, on
+        reste dans la même colonne (flèches haut/bas) et on s'arrête aux bords ;
+        sinon on parcourt toutes les cellules (Tab) en revenant au début.
+        """
+        editor = self._editor
+        if editor is None:
+            return "break"
+        cells = self._editable_cells()
+        index = cells.index((editor.iid, editor.column))
+        if same_column:
+            candidates = [
+                cell for cell in (cells[index + step :] if step > 0 else cells[:index][::-1])
+                if cell[1] == editor.column
+            ]
+            target = candidates[0] if candidates else None
+        else:
+            target = cells[(index + step) % len(cells)]
+        if target is None:
+            return "break"
+        # Les iid changent si la saisie modifie l'objet : on repère la cible par chemin.
+        target_path, target_column = self._nodes[target[0]].path, target[1]
+        old_path = editor.node.path
+        new_path = self._finish_edit(commit=True)
+        if new_path is None:  # saisie refusée, le champ est rouvert
+            return "break"
+        if target_path[: len(old_path)] == old_path:  # cible dans le nœud renommé
+            target_path = new_path + target_path[len(old_path) :]
+        iid = self._iid_for(target_path)
+        if iid is not None:
+            self._start_edit(iid, target_column)
+        return "break"
+
+    def _tab_from_tree(self, step: int) -> str:
+        """Tab depuis l'arbre : ouvre la première (ou dernière) cellule de la ligne."""
+        cells = self._editable_cells()
+        if not cells:
+            return "break"
+        selection = self.tree.selection()
+        row_cells = [cell for cell in cells if selection and cell[0] == selection[0]]
+        if row_cells:
+            target = row_cells[0] if step > 0 else row_cells[-1]
+        else:
+            target = cells[0] if step > 0 else cells[-1]
+        self._start_edit(*target)
+        return "break"
+
     # -- mutation avec historique ----------------------------------------
-    def _mutate(self, action: Callable[[], None]) -> None:
+    def _mutate(self, action: Callable[[], Any], origin: Path | None = None) -> bool:
+        """Applique ``action`` avec possibilité d'annulation ; False en cas d'erreur.
+
+        Si ``action`` retourne un chemin, celui-ci est sélectionné après mise à
+        jour ; avec ``origin``, il est considéré comme le nouveau chemin du nœud
+        ``origin`` (renommage).
+        """
         snapshot = copy.deepcopy(self.obj)
         try:
-            action()
+            new_path = action()
         except Exception as exc:  # noqa: BLE001 (erreur affichée à l'utilisateur)
             self.obj = snapshot
+            self.refresh()
             messagebox.showerror("Erreur", str(exc), parent=self)
-        else:
-            self._undo.append(snapshot)
-        self.refresh()
+            return False
+        self._undo.append(snapshot)
+        if not isinstance(new_path, tuple):
+            new_path = None
+        moved = (origin, new_path) if origin is not None and new_path is not None else None
+        self.refresh(select=new_path, moved=moved)
+        return True
 
     # -- actions ----------------------------------------------------------
-    def _on_edit(self) -> None:
-        node = self._selected()
-        if node is None or not node.editable:
-            return
-        raw = simpledialog.askstring(
-            "Modifier la valeur",
-            f"{node.label} ({node.type_name})",
-            initialvalue=node.edit_text,
-            parent=self,
-        )
-        if raw is not None:
-            self._mutate(lambda: self.adapter.set_value(self.obj, node.path, raw))
 
     def _on_add(self) -> None:
         node = self._selected()
