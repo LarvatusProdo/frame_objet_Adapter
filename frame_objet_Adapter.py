@@ -26,6 +26,7 @@ import copy
 import json
 import sys
 import tkinter as tk
+import tkinter.font as tkfont
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
@@ -221,6 +222,27 @@ class ObjectEditorApp(tk.Tk):
 
     UNDO_LIMIT = 50
 
+    # Couleur du texte (et de la pastille) selon le type de la valeur.
+    TYPE_COLORS: dict[str, str] = {
+        "dict": "#1f5fa8",
+        "list": "#2e7d32",
+        "tuple": "#00796b",
+        "str": "#b03a2e",
+        "int": "#b35c00",
+        "float": "#8e6a00",
+        "bool": "#6a3fa0",
+        "NoneType": "#808080",
+    }
+    DEFAULT_TYPE_COLOR = "#333333"
+    # Fond des lignes conteneurs (affichées en gras).
+    CONTAINER_BACKGROUNDS: dict[str, str] = {
+        "dict": "#e6effa",
+        "list": "#e8f5e9",
+        "tuple": "#e0f2f1",
+    }
+    DEFAULT_CONTAINER_BACKGROUND = "#f0f0f0"
+    SELECTION_BACKGROUND = "#3a6ea5"
+
     def __init__(
         self,
         obj: Any,
@@ -239,6 +261,8 @@ class ObjectEditorApp(tk.Tk):
 
         self._undo: deque[Any] = deque(maxlen=self.UNDO_LIMIT)
         self._nodes: dict[str, Node] = {}
+        self._icons: dict[str, tk.PhotoImage] = {}  # références à conserver (sinon GC)
+        self._styled_tags: set[str] = set()
 
         self._build_menu()
         self._build_tree()
@@ -261,7 +285,22 @@ class ObjectEditorApp(tk.Tk):
         self.bind("<Control-s>", lambda _e: self._on_save())
         self.bind("<Control-z>", lambda _e: self._on_undo())
 
+    def _build_style(self) -> None:
+        style = ttk.Style(self)
+        default_font = tkfont.nametofont("TkDefaultFont")
+        self._bold_font = default_font.copy()
+        self._bold_font.configure(weight="bold")
+        style.configure("Treeview", rowheight=int(default_font.metrics("linespace") * 1.6))
+        style.configure("Treeview.Heading", font=self._bold_font)
+        # Garde la ligne sélectionnée lisible malgré les couleurs des tags.
+        style.map(
+            "Treeview",
+            background=[("selected", self.SELECTION_BACKGROUND)],
+            foreground=[("selected", "white")],
+        )
+
     def _build_tree(self) -> None:
+        self._build_style()
         frame = ttk.Frame(self)
         frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
 
@@ -304,13 +343,48 @@ class ObjectEditorApp(tk.Tk):
             iid = self.tree.insert(
                 parent_iid,
                 "end",
-                text=node.label,
+                text=" " + node.label,
+                image=self._icon(node.type_name),
                 values=(node.display, node.type_name),
+                tags=self._tags(node),
                 open=expand_all or node.path in expanded,
             )
             self._nodes[iid] = node
             if node.is_container:
                 self._populate(iid, node.path, expanded, expand_all)
+
+    def _icon(self, type_name: str) -> tk.PhotoImage:
+        """Pastille carrée de la couleur du type (créée une seule fois)."""
+        if type_name not in self._icons:
+            color = self.TYPE_COLORS.get(type_name, self.DEFAULT_TYPE_COLOR)
+            icon = tk.PhotoImage(width=12, height=12)
+            icon.put(color, to=(2, 2, 11, 11))
+            self._icons[type_name] = icon
+        return self._icons[type_name]
+
+    def _tags(self, node: Node) -> tuple[str, ...]:
+        """Tags de style d'une ligne, configurés à la première utilisation.
+
+        Le tag ``type:`` ne fixe que la couleur du texte et le tag ``container:``
+        que le fond et la police : aucun conflit de priorité entre les deux.
+        """
+        tags = [f"type:{node.type_name}"]
+        if node.is_container:
+            tags.append(f"container:{node.type_name}")
+        for tag in tags:
+            if tag in self._styled_tags:
+                continue
+            kind, type_name = tag.split(":", 1)
+            if kind == "type":
+                color = self.TYPE_COLORS.get(type_name, self.DEFAULT_TYPE_COLOR)
+                self.tree.tag_configure(tag, foreground=color)
+            else:
+                background = self.CONTAINER_BACKGROUNDS.get(
+                    type_name, self.DEFAULT_CONTAINER_BACKGROUND
+                )
+                self.tree.tag_configure(tag, background=background, font=self._bold_font)
+            self._styled_tags.add(tag)
+        return tuple(tags)
 
     def _walk(self, parent_iid: str):
         for iid in self.tree.get_children(parent_iid):
@@ -427,7 +501,7 @@ def main(argv: list[str]) -> None:
             "version": 1.0,
             "actif": True,
             "tags": ["python", "tkinter"],
-            "base": {"hote": "localhost", "port": 5432},
+            "base": {"hote": "localhost", "port": 5432, "timeout": None},
         }
     result = edit_object(initial)
     print("Annulé." if result is None else json.dumps(result, ensure_ascii=False, indent=2))
