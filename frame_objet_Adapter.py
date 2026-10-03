@@ -13,9 +13,9 @@ un adaptateur et de le déclarer avec ``@registry.register``. La GUI ne change p
 
 Usage
 -----
-    python object_editor.py [fichier.json]
+    python frame_objet_Adapter.py [fichier.json]
 
-    from object_editor import edit_object
+    from frame_objet_Adapter import edit_object
     nouveau = edit_object({"a": 1})   # None si l'utilisateur annule
 """
 
