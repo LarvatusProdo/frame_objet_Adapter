@@ -24,6 +24,8 @@ from __future__ import annotations
 import ast
 import copy
 import json
+import os
+import re
 import sys
 import tkinter as tk
 import tkinter.font as tkfont
@@ -52,6 +54,33 @@ class Node:
     editable: bool
     renamable: bool = False  # la clé peut-elle être modifiée ?
     key_edit_text: str = ""  # texte proposé lors du renommage de la clé
+    path_kind: str | None = None  # "dir" / "file" si la valeur ressemble à un chemin
+
+
+# Début typique d'un chemin : « C:\ », « C:/ », « \\serveur », « / », « ~/ », « ./ », « ../ ».
+_PATH_START = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|/|~[\\/]?|\.{1,2}[\\/])")
+
+
+def guess_path_kind(value: Any) -> str | None:
+    """Retourne ``"dir"``, ``"file"`` ou None selon que ``value`` ressemble à un chemin.
+
+    Un chemin existant est classé d'après le disque. Sinon, on se fie à sa forme :
+    avec une extension c'est un fichier, sans extension un dossier. Une chaîne
+    relative sans séparateur (« python ») n'est jamais considérée comme un chemin.
+    """
+    if not isinstance(value, str) or not value.strip() or "\n" in value:
+        return None
+    has_separator = "/" in value or "\\" in value
+    if not (_PATH_START.match(value) or has_separator):
+        return None
+    expanded = os.path.expanduser(value)
+    if os.path.isdir(expanded):
+        return "dir"
+    if os.path.isfile(expanded):
+        return "file"
+    if not _PATH_START.match(value):  # « km/h », « a/b »… : pas assez fiable
+        return None
+    return "file" if os.path.splitext(value)[1] else "dir"
 
 
 def parse_literal(text: str) -> Any:
@@ -177,6 +206,7 @@ class DictAdapter(ObjectAdapter):
                     editable=not is_container,
                     renamable=in_dict,
                     key_edit_text=key if isinstance(key, str) else repr(key),
+                    path_kind=guess_path_kind(value),
                 )
             )
         return nodes
@@ -297,6 +327,7 @@ class ObjectEditorApp(tk.Tk):
     DEFAULT_CONTAINER_BACKGROUND = "#f0f0f0"
     SELECTION_BACKGROUND = "#3a6ea5"
     ICON_SIZE = 12
+    PATH_KIND_LABELS = {"dir": "dossier", "file": "fichier"}
 
     def __init__(
         self,
@@ -319,6 +350,7 @@ class ObjectEditorApp(tk.Tk):
         self._icons: dict[str, tk.PhotoImage] = {}  # références à conserver (sinon GC)
         self._styled_tags: set[str] = set()
         self._editor: _InlineEditor | None = None
+        self._path_buttons: dict[str, ttk.Button] = {}  # iid -> bouton « parcourir »
 
         self._build_menu()
         self._build_tree()
@@ -348,6 +380,7 @@ class ObjectEditorApp(tk.Tk):
         self._bold_font.configure(weight="bold")
         style.configure("Treeview", rowheight=int(default_font.metrics("linespace") * 1.6))
         style.configure("Treeview.Heading", font=self._bold_font)
+        style.configure("Path.TButton", padding=0)
         # Garde la ligne sélectionnée lisible malgré les couleurs des tags.
         style.map(
             "Treeview",
@@ -375,7 +408,11 @@ class ObjectEditorApp(tk.Tk):
 
         self.tree.bind("<Double-1>", self._on_double_click)
         self.tree.bind("<Button-1>", lambda _e: self._finish_edit(commit=True), add=True)
-        self.tree.bind("<Configure>", lambda _e: self._place_editor(), add=True)
+        self.tree.bind("<Configure>", lambda _e: self._place_overlays(), add=True)
+        # Ouverture/fermeture d'un nœud, redimensionnement d'une colonne : l'arbre
+        # n'est à jour qu'après le traitement de l'événement, d'où after_idle.
+        for sequence in ("<<TreeviewOpen>>", "<<TreeviewClose>>", "<B1-Motion>", "<ButtonRelease-1>"):
+            self.tree.bind(sequence, lambda _e: self.after_idle(self._place_overlays), add=True)
         self.tree.bind("<Return>", lambda _e: self._edit_selected(VALUE_COLUMN))
         self.tree.bind("<F2>", lambda _e: self._edit_selected(KEY_COLUMN))
         self.tree.bind("<Tab>", lambda _e: self._tab_from_tree(+1))
@@ -412,6 +449,9 @@ class ObjectEditorApp(tk.Tk):
         if moved is not None:
             old, new = moved
             expanded = {new + p[len(old):] if p[: len(old)] == old else p for p in expanded}
+        for button in self._path_buttons.values():
+            button.destroy()
+        self._path_buttons.clear()
         self.tree.delete(*self.tree.get_children())
         self._nodes.clear()
         self._populate("", (), expanded, expand_all)
@@ -420,21 +460,50 @@ class ObjectEditorApp(tk.Tk):
             self.tree.selection_set(iid)
             self.tree.focus(iid)
             self.tree.see(iid)
+        self.after_idle(self._place_overlays)
 
     def _populate(self, parent_iid: str, path: Path, expanded: set[Path], expand_all: bool) -> None:
         for node in self.adapter.children(self.obj, path):
+            type_label = node.type_name
+            if node.path_kind:
+                type_label += f" ({self.PATH_KIND_LABELS[node.path_kind]})"
             iid = self.tree.insert(
                 parent_iid,
                 "end",
                 text=" " + node.label,
                 image=self._icon(node.type_name),
-                values=(node.display, node.type_name),
+                values=(node.display, type_label),
                 tags=self._tags(node),
                 open=expand_all or node.path in expanded,
             )
             self._nodes[iid] = node
+            if node.path_kind and node.editable:
+                self._path_buttons[iid] = ttk.Button(
+                    self.tree,
+                    image=self._path_icon(node.path_kind),
+                    style="Path.TButton",
+                    takefocus=False,
+                    command=lambda n=node: self._browse_path(n),
+                )
             if node.is_container:
                 self._populate(iid, node.path, expanded, expand_all)
+
+    def _path_icon(self, kind: str) -> tk.PhotoImage:
+        """Icône dessinée du bouton « parcourir » : dossier ou feuille."""
+        name = f"path:{kind}"
+        if name not in self._icons:
+            icon = tk.PhotoImage(width=16, height=14)
+            if kind == "dir":
+                icon.put("#c98a00", to=(1, 1, 7, 4))  # onglet
+                icon.put("#c98a00", to=(1, 3, 15, 13))  # contour
+                icon.put("#f2c14e", to=(2, 4, 14, 12))  # corps
+            else:
+                icon.put("#7a7a7a", to=(3, 0, 13, 14))  # contour
+                icon.put("#ffffff", to=(4, 1, 12, 13))  # page
+                for y in (4, 7, 10):
+                    icon.put("#9aa7b8", to=(6, y, 11, y + 1))  # lignes de texte
+            self._icons[name] = icon
+        return self._icons[name]
 
     def _icon(self, type_name: str) -> tk.PhotoImage:
         """Pastille carrée de la couleur du type (créée une seule fois)."""
@@ -535,12 +604,26 @@ class ObjectEditorApp(tk.Tk):
         entry.bind("<FocusOut>", lambda _e: self.after_idle(self._on_editor_focus_out))
         self._editor = _InlineEditor(entry, iid, column, node)
         self.update_idletasks()  # bbox n'est fiable qu'une fois l'arbre affiché
-        self._place_editor()
+        self._place_overlays()
         entry.focus_set()
         return True
 
-    def _place_editor(self) -> None:
-        """(Re)positionne le champ sur sa cellule (après défilement, redimensionnement…)."""
+    def _place_overlays(self) -> None:
+        """(Re)positionne les widgets superposés à l'arbre : boutons « parcourir »
+        et champ de saisie (après défilement, redimensionnement, ouverture…)."""
+        try:
+            self.tree.winfo_exists()
+        except tk.TclError:  # appel différé arrivé après la fermeture de la fenêtre
+            return
+        for iid, button in self._path_buttons.items():
+            bbox = self.tree.bbox(iid, VALUE_COLUMN)
+            if not bbox:  # ligne masquée ou hors de la zone visible
+                button.place_forget()
+                continue
+            x, y, width, height = bbox
+            size = height - 2  # bouton carré
+            button.place(x=x + width - size - 1, y=y + 1, width=size, height=size)
+
         editor = self._editor
         if editor is None:
             return
@@ -553,7 +636,46 @@ class ObjectEditorApp(tk.Tk):
             # bbox tient déjà compte de la profondeur ; on saute l'indicateur et la pastille.
             offset = self._indent() + self.ICON_SIZE
             x, width = x + offset, max(width - offset, 40)
+        elif editor.iid in self._path_buttons:
+            width = max(width - (height - 2) - 2, 40)  # laisse le bouton accessible
         editor.entry.place(x=x, y=y, width=width, height=height)
+
+    def _browse_path(self, node: Node) -> None:
+        """Choisit un dossier ou un fichier pour la valeur ``node``.
+
+        Si la cellule est en cours d'édition, le chemin choisi remplace le texte
+        du champ (à valider ensuite) ; sinon la valeur est modifiée directement.
+        """
+        editor = self._editor
+        editing = (
+            editor is not None and editor.node.path == node.path and editor.column == VALUE_COLUMN
+        )
+        current = parse_literal(editor.entry.get() if editing else node.edit_text)
+        current = current if isinstance(current, str) else ""
+        initial = os.path.expanduser(current)
+        initial_dir = initial if os.path.isdir(initial) else os.path.dirname(initial)
+        if node.path_kind == "dir":
+            chosen = filedialog.askdirectory(
+                parent=self, initialdir=initial_dir or None, mustexist=False
+            )
+        else:
+            chosen = filedialog.askopenfilename(
+                parent=self,
+                initialdir=initial_dir or None,
+                initialfile=os.path.basename(initial) or None,
+            )
+        if not chosen:
+            return
+        if "\\" in current and "/" not in current:  # conserve le style de séparateur
+            chosen = chosen.replace("/", "\\")
+        text = repr(chosen)
+        editor = self._editor  # le champ a pu être fermé pendant le dialogue
+        if editing and editor is not None and editor.node.path == node.path:
+            editor.entry.delete(0, "end")
+            editor.entry.insert(0, text)
+            editor.entry.focus_set()
+        else:
+            self._mutate(lambda: self.adapter.set_value(self.obj, node.path, text))
 
     def _indent(self) -> int:
         try:
@@ -563,7 +685,7 @@ class ObjectEditorApp(tk.Tk):
 
     def _on_tree_scroll(self, first: str, last: str) -> None:
         self._scrollbar.set(first, last)
-        self._place_editor()
+        self._place_overlays()
 
     def _on_editor_focus_out(self) -> None:
         editor = self._editor
@@ -787,6 +909,7 @@ def main(argv: list[str]) -> None:
             "actif": True,
             "tags": ["python", "tkinter"],
             "base": {"hote": "localhost", "port": 5432, "timeout": None},
+            "paths": ["C:/Users", "D:/"],
         }
     result = edit_object(initial)
     print("Annulé." if result is None else json.dumps(result, ensure_ascii=False, indent=2))
