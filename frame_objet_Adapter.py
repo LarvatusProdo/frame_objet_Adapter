@@ -5,15 +5,16 @@ Architecture
 - ``Node`` : description neutre d'une ligne de l'arbre (aucune dépendance GUI).
 - ``ObjectAdapter`` : contrat à implémenter pour chaque type d'objet éditable.
 - ``DictAdapter`` : implémentation pour ``dict`` (avec ``dict`` et ``list`` imbriqués).
+- ``DatasetAdapter`` : implémentation pour ``xarray.Dataset`` (si xarray est installé).
 - ``AdapterRegistry`` : choisit automatiquement l'adaptateur selon le type de l'objet.
 - ``ObjectEditorApp`` : fenêtre tkinter, indépendante du type édité.
 
-Pour supporter un nouveau type (ex : ``xarray.Dataset``), il suffit d'écrire
-un adaptateur et de le déclarer avec ``@registry.register``. La GUI ne change pas.
+Pour supporter un nouveau type, il suffit d'écrire un adaptateur et de le
+déclarer avec ``@registry.register``. La GUI ne change pas.
 
 Usage
 -----
-    python frame_objet_Adapter.py [fichier.json]
+    python frame_objet_Adapter.py [fichier.json | fichier.nc | --xarray]
 
     from frame_objet_Adapter import edit_object
     nouveau = edit_object({"a": 1})   # None si l'utilisateur annule
@@ -23,6 +24,8 @@ from __future__ import annotations
 
 import ast
 import copy
+import dataclasses
+import fnmatch
 import json
 import os
 import re
@@ -34,6 +37,13 @@ from collections import deque
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any, Callable
+
+try:  # dépendances facultatives : seulement pour éditer des objets xarray
+    import numpy as np
+    import pandas as pd
+    import xarray as xr
+except ImportError:
+    np = pd = xr = None
 
 Path = tuple[Any, ...]  # chemin d'accès à un élément, ex : ("db", "ports", 0)
 
@@ -55,6 +65,16 @@ class Node:
     renamable: bool = False  # la clé peut-elle être modifiée ?
     key_edit_text: str = ""  # texte proposé lors du renommage de la clé
     path_kind: str | None = None  # "dir" / "file" si la valeur ressemble à un chemin
+    type_label: str = ""  # texte de la colonne « Type » (par défaut : type_name)
+
+
+@dataclass(frozen=True)
+class NewRoot:
+    """Résultat d'une opération qui remplace l'objet racine au lieu de le
+    modifier en place (ex : renommer une variable d'un ``xarray.Dataset``)."""
+
+    obj: Any
+    path: Path | None = None  # chemin à sélectionner dans le nouvel objet
 
 
 # Début typique d'un chemin : « C:\ », « C:/ », « \\serveur », « / », « ~/ », « ./ », « ../ ».
@@ -103,6 +123,8 @@ class ObjectAdapter(ABC):
     """Interface entre un type d'objet et l'éditeur graphique."""
 
     file_types: list[tuple[str, str]] = [("Tous les fichiers", "*.*")]
+    # Profondeur des nœuds ouverts à l'affichage initial (None : tout ouvrir).
+    expand_depth: int | None = None
 
     @classmethod
     @abstractmethod
@@ -114,8 +136,12 @@ class ObjectAdapter(ABC):
         """Liste les enfants directs du nœud situé à ``path``."""
 
     @abstractmethod
-    def set_value(self, obj: Any, path: Path, raw: str) -> None:
-        """Modifie en place la valeur située à ``path``."""
+    def set_value(self, obj: Any, path: Path, raw: str) -> NewRoot | None:
+        """Modifie en place la valeur située à ``path``.
+
+        Comme ``rename_key``, ``add_item`` et ``delete_item``, peut retourner un
+        ``NewRoot`` si l'objet ne peut pas être modifié en place.
+        """
 
     def can_add(self, obj: Any, path: Path) -> bool:
         return False
@@ -123,15 +149,19 @@ class ObjectAdapter(ABC):
     def requires_key(self, obj: Any, path: Path) -> bool:
         return False
 
-    def rename_key(self, obj: Any, path: Path, raw: str) -> Path:
+    def add_hint(self, obj: Any, path: Path) -> str:
+        """Invite affichée lors de la saisie d'une nouvelle valeur dans ``path``."""
+        return "Valeur (ex : 42, 'texte', [1, 2]) :"
+
+    def rename_key(self, obj: Any, path: Path, raw: str) -> Path | NewRoot:
         """Renomme la clé située à ``path`` et retourne le nouveau chemin."""
         raise NotImplementedError("Renommage non supporté pour ce type.")
 
-    def add_item(self, obj: Any, path: Path, key: str | None, raw: str) -> Path:
+    def add_item(self, obj: Any, path: Path, key: str | None, raw: str) -> Path | NewRoot:
         """Ajoute un élément dans le conteneur ``path`` et retourne son chemin."""
         raise NotImplementedError("Ajout non supporté pour ce type.")
 
-    def delete_item(self, obj: Any, path: Path) -> None:
+    def delete_item(self, obj: Any, path: Path) -> NewRoot | None:
         raise NotImplementedError("Suppression non supportée pour ce type.")
 
     def read(self, filename: str) -> Any:
@@ -156,6 +186,22 @@ class AdapterRegistry:
             if adapter_cls.supports(obj):
                 return adapter_cls()
         raise TypeError(f"Aucun adaptateur pour le type {type(obj).__name__}.")
+
+    def for_file(self, filename: str) -> ObjectAdapter | None:
+        """Adaptateur dont un motif de ``file_types`` correspond à ``filename``."""
+        name = os.path.basename(filename).lower()
+        for adapter_cls in reversed(self._adapters):
+            for _label, patterns in adapter_cls.file_types:
+                if any(p != "*.*" and fnmatch.fnmatch(name, p) for p in patterns.split()):
+                    return adapter_cls()
+        return None
+
+    def file_types(self, first: ObjectAdapter | None = None) -> list[tuple[str, str]]:
+        """Types de fichiers de tous les adaptateurs, ceux de ``first`` en tête."""
+        ordered = [type(first)] if first is not None else []
+        ordered += [cls for cls in reversed(self._adapters) if cls not in ordered]
+        types = [ft for cls in ordered for ft in cls.file_types if ft[1] != "*.*"]
+        return list(dict.fromkeys(types)) + [("Tous les fichiers", "*.*")]
 
 
 registry = AdapterRegistry()
@@ -285,6 +331,317 @@ class DictAdapter(ObjectAdapter):
 
 
 # ---------------------------------------------------------------------------
+# Adaptateur xarray.Dataset
+# ---------------------------------------------------------------------------
+def _require_xarray() -> None:
+    if xr is None:
+        raise ImportError("Le module xarray (avec numpy et pandas) n'est pas installé.")
+
+
+def _scalar_texts(value: Any) -> tuple[str, str, str]:
+    """(texte affiché, texte d'édition, nom de type) d'un élément de tableau numpy."""
+    if isinstance(value, np.datetime64):
+        text = str(pd.Timestamp(value))
+        return text, repr(text), "datetime64"
+    if isinstance(value, np.timedelta64):
+        text = str(pd.Timedelta(value))
+        return text, repr(text), "timedelta64"
+    if isinstance(value, np.generic):
+        value = value.item()
+    return repr(value), repr(value), type(value).__name__
+
+
+def _preview(values: Any, limit: int = 6) -> str:
+    """Premières valeurs d'un tableau, aplati : « 1.0, 2.0, 3.0, … »."""
+    flat = np.ravel(values)
+    texts = [_scalar_texts(v)[0] for v in flat[:limit]]
+    return ", ".join(texts) + (", …" if flat.size > limit else "")
+
+
+def _coerce(value: Any, dtype: np.dtype) -> Any:
+    """Convertit une valeur saisie pour l'écrire dans un tableau de type ``dtype``."""
+    kind = dtype.kind
+    if kind == "M":  # dates : '2024-01-31', '2024-01-31 12:00'…
+        return np.datetime64("NaT") if value is None else pd.Timestamp(value).to_datetime64()
+    if kind == "m":  # durées : '1 days', '02:30:00'…
+        return np.timedelta64("NaT") if value is None else pd.Timedelta(value).to_timedelta64()
+    if kind == "b":
+        if not isinstance(value, bool):
+            raise TypeError("Valeur booléenne attendue (True ou False).")
+        return value
+    if kind in "iufc":
+        if value is None and kind in "fc":
+            return float("nan")
+        if isinstance(value, str):  # 'nan', 'inf'… ne sont pas des littéraux Python
+            try:
+                return {"i": int, "u": int, "f": float, "c": complex}[kind](value)
+            except ValueError:
+                pass
+        if not isinstance(value, (int, float, complex)):
+            raise TypeError(f"Valeur numérique attendue (type {dtype}).")
+        return value
+    if kind == "U":
+        return value if isinstance(value, str) else str(value)
+    if kind == "S":
+        return value if isinstance(value, bytes) else str(value).encode()
+    return value  # object : valeur prise telle quelle
+
+
+def _widen(arr: np.ndarray, value: Any) -> np.ndarray:
+    """Élargit le type de ``arr`` si ``value`` n'y tient pas (chaîne plus longue,
+    réel dans un tableau d'entiers…), pour éviter une troncature silencieuse."""
+    kind = arr.dtype.kind
+    if kind in "US":
+        needed = np.dtype(f"{kind}{max(len(value), 1)}")
+    elif kind in "iufc":
+        needed = np.result_type(arr.dtype, value)
+    else:
+        return arr
+    new_dtype = np.promote_types(arr.dtype, needed)
+    return arr if new_dtype == arr.dtype else arr.astype(new_dtype)
+
+
+@registry.register
+class DatasetAdapter(ObjectAdapter):
+    """Édition d'un ``xarray.Dataset``.
+
+    Arborescence et chemins :
+
+    - ``("dims",)`` : tailles des dimensions (lecture seule) ;
+    - ``("coords", nom)`` / ``("data_vars", nom)`` : une variable. Ses enfants :
+      ``(…, "attrs", clé)`` pour ses attributs, puis ses valeurs :
+      1 dimension : ``(…, i)`` un élément par ligne ;
+      2 dimensions : ``(…, i)`` une ligne par indice de la 1re dimension, et
+      ``(…, i, j)`` une cellule par indice de la 2de ;
+      0 dimension : la valeur s'édite directement sur la ligne de la variable ;
+      3 dimensions ou plus : pas de valeurs détaillées, seulement le résumé
+      « (dimensions) | valeurs… » ;
+    - ``("attrs", clé)`` : attributs globaux.
+
+    Les attributs sont des ``dict`` : leur édition est confiée à ``DictAdapter``.
+    """
+
+    file_types = [("NetCDF", "*.nc *.nc4 *.cdf"), ("Tous les fichiers", "*.*")]
+    expand_depth = 2  # groupes ouverts, variables fermées
+    GROUPS = {"coords": "Coordonnées", "data_vars": "Variables"}
+    ATTRS = "attrs"
+    MORE = "…"  # dernier élément du chemin d'une ligne « n éléments non affichés »
+    # Nombre maximal de lignes / de cellules par ligne affichées pour un tableau.
+    MAX_ROWS = 50
+    MAX_COLUMNS = 20
+
+    @classmethod
+    def supports(cls, obj: Any) -> bool:
+        return xr is not None and isinstance(obj, xr.Dataset)
+
+    # -- outils -----------------------------------------------------------
+    def _split_attrs(self, ds: Any, path: Path) -> tuple[dict | None, Path]:
+        """Si ``path`` est dans des attributs : (dict des attributs, chemin du groupe)."""
+        if path[:1] == (self.ATTRS,):
+            return ds.attrs, path[:1]
+        if len(path) >= 3 and path[0] in self.GROUPS and path[2] == self.ATTRS:
+            return ds.variables[path[1]].attrs, path[:3]
+        return None, ()
+
+    def _variable_path(self, path: Path) -> bool:
+        return len(path) == 2 and path[0] in self.GROUPS
+
+    @staticmethod
+    def _group_of(ds: Any, name: Any) -> str:
+        return "coords" if name in ds.coords else "data_vars"
+
+    # -- lecture ----------------------------------------------------------
+    def children(self, ds: Any, path: Path) -> list[Node]:
+        attrs, prefix = self._split_attrs(ds, path)
+        if attrs is not None:
+            return self._attr_nodes(attrs, prefix, path[len(prefix) :])
+        if not path:
+            sizes = ", ".join(f"{dim}: {size}" for dim, size in ds.sizes.items())
+            return [
+                Node(("dims",), "Dimensions", sizes, "dims", "", False, False),
+                *(self._group_node(ds, group) for group in self.GROUPS),
+                self._attrs_node(ds.attrs, (self.ATTRS,), "Attributs"),
+            ]
+        if len(path) == 1:
+            names = ds.coords if path[0] == "coords" else ds.data_vars
+            return [self._variable_node(ds, path + (name,)) for name in names]
+        var = ds.variables[path[1]]
+        index = path[2:]
+        nodes = [] if index else [self._attrs_node(var.attrs, path + (self.ATTRS,), "attrs")]
+        if 1 <= var.ndim <= 2:
+            nodes += self._element_nodes(ds, path, var)
+        return nodes
+
+    def _group_node(self, ds: Any, group: str) -> Node:
+        count = len(ds.coords if group == "coords" else ds.data_vars)
+        return Node(
+            (group,), self.GROUPS[group], f"({count} variable(s))", "Dataset", "",
+            is_container=True, editable=False, type_label=group,
+        )
+
+    @staticmethod
+    def _attrs_node(attrs: dict, path: Path, label: str) -> Node:
+        return Node(path, label, f"({len(attrs)} élément(s))", "dict", "", True, False)
+
+    def _attr_nodes(self, attrs: dict, prefix: Path, rest: Path) -> list[Node]:
+        nodes = []
+        for node in DictAdapter().children(attrs, rest):
+            value = DictAdapter._resolve(attrs, node.path)
+            changes: dict[str, Any] = {"path": prefix + node.path}
+            if isinstance(value, (np.ndarray, np.generic)):  # éditable comme liste / scalaire
+                text = repr(value.tolist())
+                changes.update(display=text, edit_text=text)
+            nodes.append(dataclasses.replace(node, **changes))
+        return nodes
+
+    def _variable_node(self, ds: Any, path: Path) -> Node:
+        name = path[1]
+        var = ds.variables[name]
+        if var.ndim == 0:
+            display, edit_text, _ = _scalar_texts(var.values[()])
+        else:
+            sizes = ", ".join(f"{dim}: {size}" for dim, size in var.sizes.items())
+            display, edit_text = f"({sizes}) | {_preview(var.values)}", ""
+        return Node(
+            path=path,
+            label=str(name),
+            display=display,
+            type_name="Variable",
+            edit_text=edit_text,
+            is_container=True,  # contient au moins ses attributs
+            editable=var.ndim == 0,
+            renamable=True,
+            key_edit_text=str(name),
+            type_label=str(var.dtype),
+        )
+
+    def _element_nodes(self, ds: Any, path: Path, var: Any) -> list[Node]:
+        """Éléments (1-D), lignes (2-D) ou cellules d'une ligne (2-D) d'une variable."""
+        name, index = path[1], path[2:]
+        dim = var.dims[len(index)]
+        values = var.values[index]
+        # Valeurs de la coordonnée de dimension, pour repérer chaque indice.
+        coord = ds.variables[dim].values if dim in ds.coords and dim != name else None
+        limit = self.MAX_ROWS if not index else self.MAX_COLUMNS
+        is_row = var.ndim == 2 and not index
+        nodes = []
+        for i in range(min(len(values), limit)):
+            label = f"[{i}]"
+            if coord is not None:
+                label += f"  {dim} = {_scalar_texts(coord[i])[0]}"
+            if is_row:
+                nodes.append(
+                    Node(
+                        path + (i,), label, _preview(values[i]), "list", "",
+                        is_container=True, editable=False,
+                        type_label=f"ligne ({var.dims[1]}: {len(values[i])})",
+                    )
+                )
+                continue
+            display, edit_text, type_name = _scalar_texts(values[i])
+            nodes.append(
+                Node(
+                    path + (i,), label, display, type_name, edit_text,
+                    is_container=False, editable=True,
+                    path_kind=guess_path_kind(values[i]),
+                )
+            )
+        if len(values) > limit:
+            hidden = f"{len(values) - limit} élément(s) non affiché(s)"
+            nodes.append(Node(path + (self.MORE,), self.MORE, hidden, "", "", False, False))
+        return nodes
+
+    # -- écriture ---------------------------------------------------------
+    def set_value(self, ds: Any, path: Path, raw: str) -> NewRoot | None:
+        attrs, prefix = self._split_attrs(ds, path)
+        if attrs is not None:
+            return DictAdapter().set_value(attrs, path[len(prefix) :], raw)
+        if len(path) < 2 or path[0] not in self.GROUPS:
+            raise ValueError("Ce nœud n'est pas modifiable.")
+        name, index = path[1], path[2:]
+        var = ds.variables[name]
+        if len(index) != var.ndim:
+            raise ValueError("Seules les valeurs individuelles sont modifiables.")
+        arr = np.array(var.values)  # copie : les données d'origine peuvent être en lecture seule
+        value = _coerce(parse_literal(raw), arr.dtype)
+        arr = _widen(arr, value)
+        arr[index] = value
+        if name in ds.xindexes:
+            # Coordonnée indexée : la réaffecter reconstruit aussi l'index pandas,
+            # puis on rétablit l'ordre d'origine des variables.
+            updated = ds.assign_coords({name: var.copy(deep=False, data=arr)})
+            return NewRoot(updated[list(ds.variables)], path)
+        var.data = arr  # en place : conserve l'ordre des variables
+        return None
+
+    def can_add(self, ds: Any, path: Path) -> bool:
+        attrs, prefix = self._split_attrs(ds, path)
+        if attrs is not None:
+            return DictAdapter().can_add(attrs, path[len(prefix) :])
+        return len(path) == 1 and path[0] in self.GROUPS
+
+    def requires_key(self, ds: Any, path: Path) -> bool:
+        attrs, prefix = self._split_attrs(ds, path)
+        if attrs is not None:
+            return DictAdapter().requires_key(attrs, path[len(prefix) :])
+        return True
+
+    def add_hint(self, ds: Any, path: Path) -> str:
+        if len(path) == 1 and path[0] in self.GROUPS:
+            return "Valeur : scalaire (ex : 3.5) ou (dimensions, données),\nex : ('time', [1, 2, 3]) ou (('y', 'x'), [[1, 2], [3, 4]])"
+        return super().add_hint(ds, path)
+
+    def rename_key(self, ds: Any, path: Path, raw: str) -> Path | NewRoot:
+        attrs, prefix = self._split_attrs(ds, path)
+        if attrs is not None and path != prefix:
+            return prefix + DictAdapter().rename_key(attrs, path[len(prefix) :], raw)
+        if not self._variable_path(path):
+            raise ValueError("Ce nœud ne peut pas être renommé.")
+        old = path[1]
+        if not raw:
+            raise ValueError("Le nom ne peut pas être vide.")
+        if raw == old:
+            return path
+        if raw in ds.variables:
+            raise ValueError(f"La variable {raw!r} existe déjà.")
+        # Renomme aussi la dimension s'il s'agit d'une coordonnée de dimension.
+        renamed = ds.rename({old: raw})
+        return NewRoot(renamed, (self._group_of(renamed, raw), raw))
+
+    def add_item(self, ds: Any, path: Path, key: str | None, raw: str) -> Path:
+        attrs, prefix = self._split_attrs(ds, path)
+        if attrs is not None:
+            return prefix + DictAdapter().add_item(attrs, path[len(prefix) :], key, raw)
+        if not (len(path) == 1 and path[0] in self.GROUPS):
+            raise ValueError("Sélectionnez le groupe Coordonnées ou Variables.")
+        if not key:
+            raise ValueError("Un nom de variable est requis.")
+        if key in ds.variables:
+            raise KeyError(f"La variable {key!r} existe déjà.")
+        target = ds.coords if path[0] == "coords" else ds
+        target[key] = parse_literal(raw)
+        return (self._group_of(ds, key), key)
+
+    def delete_item(self, ds: Any, path: Path) -> None:
+        attrs, prefix = self._split_attrs(ds, path)
+        if attrs is not None and path != prefix:
+            return DictAdapter().delete_item(attrs, path[len(prefix) :])
+        if not self._variable_path(path):
+            raise ValueError("Seuls les variables et les attributs peuvent être supprimés.")
+        del ds[path[1]]
+        return None
+
+    # -- fichiers ---------------------------------------------------------
+    def read(self, filename: str) -> Any:
+        _require_xarray()
+        with xr.open_dataset(filename) as ds:
+            return ds.load()  # charge tout en mémoire avant de fermer le fichier
+
+    def write(self, ds: Any, filename: str) -> None:
+        ds.to_netcdf(filename)
+
+
+# ---------------------------------------------------------------------------
 # Interface graphique
 # ---------------------------------------------------------------------------
 KEY_COLUMN = "#0"
@@ -316,6 +673,10 @@ class ObjectEditorApp(tk.Tk):
         "float": "#8e6a00",
         "bool": "#6a3fa0",
         "NoneType": "#808080",
+        "datetime64": "#ad1457",
+        "timedelta64": "#ad1457",
+        "Dataset": "#4a148c",
+        "Variable": "#37474f",
     }
     DEFAULT_TYPE_COLOR = "#333333"
     # Fond des lignes conteneurs (affichées en gras).
@@ -323,6 +684,8 @@ class ObjectEditorApp(tk.Tk):
         "dict": "#e6effa",
         "list": "#e8f5e9",
         "tuple": "#e0f2f1",
+        "Dataset": "#ede7f6",
+        "Variable": "#eceff1",
     }
     DEFAULT_CONTAINER_BACKGROUND = "#f0f0f0"
     SELECTION_BACKGROUND = "#3a6ea5"
@@ -463,8 +826,9 @@ class ObjectEditorApp(tk.Tk):
         self.after_idle(self._place_overlays)
 
     def _populate(self, parent_iid: str, path: Path, expanded: set[Path], expand_all: bool) -> None:
+        depth = self.adapter.expand_depth
         for node in self.adapter.children(self.obj, path):
-            type_label = node.type_name
+            type_label = node.type_label or node.type_name
             if node.path_kind:
                 type_label += f" ({self.PATH_KIND_LABELS[node.path_kind]})"
             iid = self.tree.insert(
@@ -474,7 +838,8 @@ class ObjectEditorApp(tk.Tk):
                 image=self._icon(node.type_name),
                 values=(node.display, type_label),
                 tags=self._tags(node),
-                open=expand_all or node.path in expanded,
+                open=node.path in expanded
+                or (expand_all and (depth is None or len(node.path) < depth)),
             )
             self._nodes[iid] = node
             if node.path_kind and node.editable:
@@ -809,11 +1174,13 @@ class ObjectEditorApp(tk.Tk):
 
         Si ``action`` retourne un chemin, celui-ci est sélectionné après mise à
         jour ; avec ``origin``, il est considéré comme le nouveau chemin du nœud
-        ``origin`` (renommage).
+        ``origin`` (renommage). Un ``NewRoot`` remplace l'objet édité.
         """
         snapshot = copy.deepcopy(self.obj)
         try:
             new_path = action()
+            if isinstance(new_path, NewRoot):
+                self.obj, new_path = new_path.obj, new_path.path
         except Exception as exc:  # noqa: BLE001 (erreur affichée à l'utilisateur)
             self.obj = snapshot
             self.refresh()
@@ -840,7 +1207,7 @@ class ObjectEditorApp(tk.Tk):
             if not key:
                 return
         raw = simpledialog.askstring(
-            "Nouvelle valeur", "Valeur (ex : 42, 'texte', [1, 2]) :", parent=self
+            "Nouvelle valeur", self.adapter.add_hint(self.obj, target), parent=self
         )
         if raw is not None:
             self._mutate(lambda: self.adapter.add_item(self.obj, target, key, raw))
@@ -856,11 +1223,14 @@ class ObjectEditorApp(tk.Tk):
             self.refresh()
 
     def _on_open(self) -> None:
-        filename = filedialog.askopenfilename(filetypes=self.adapter.file_types, parent=self)
+        filename = filedialog.askopenfilename(
+            filetypes=self._registry.file_types(first=self.adapter), parent=self
+        )
         if not filename:
             return
+        adapter = self._registry.for_file(filename) or self.adapter
         try:
-            new_obj = self.adapter.read(filename)
+            new_obj = adapter.read(filename)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Erreur de lecture", str(exc), parent=self)
             return
@@ -870,8 +1240,11 @@ class ObjectEditorApp(tk.Tk):
         self.refresh(expand_all=True)
 
     def _on_save(self) -> None:
+        pattern = self.adapter.file_types[0][1].split()[0]  # ex : "*.json"
         filename = filedialog.asksaveasfilename(
-            filetypes=self.adapter.file_types, defaultextension=".json", parent=self
+            filetypes=self.adapter.file_types,
+            defaultextension=pattern[1:] if pattern != "*.*" else "",
+            parent=self,
         )
         if not filename:
             return
@@ -899,9 +1272,29 @@ def edit_object(obj: Any, title: str = "Éditeur d'objet") -> Any | None:
     return app.result
 
 
+def demo_dataset() -> Any:
+    """Petit ``xarray.Dataset`` d'exemple : variables de 0 à 3 dimensions."""
+    _require_xarray()
+    time = pd.date_range("2024-01-01", periods=4, freq="D")
+    stations = ["Tours", "Paris", "Lyon"]
+    rng = np.random.default_rng(0)
+    return xr.Dataset(
+        data_vars={
+            "temperature": (("time", "station"), rng.normal(12, 3, (4, 3)).round(1), {"units": "°C"}),
+            "debit": ("time", [1.2, 3.4, 2.2, 0.9], {"units": "m3/s"}),
+            "cube": (("time", "station", "niveau"), rng.random((4, 3, 2)).round(2)),
+            "seuil": ((), 15.0),
+        },
+        coords={"time": time, "station": stations, "altitude": ("station", [60, 35, 170])},
+        attrs={"titre": "Exemple", "source": "C:/Users"},
+    )
+
+
 def main(argv: list[str]) -> None:
-    if len(argv) > 1:
-        initial = DictAdapter().read(argv[1])
+    if len(argv) > 1 and argv[1] == "--xarray":
+        initial = demo_dataset()
+    elif len(argv) > 1:
+        initial = (registry.for_file(argv[1]) or DictAdapter()).read(argv[1])
     else:
         initial = {
             "nom": "Projet",
@@ -912,8 +1305,13 @@ def main(argv: list[str]) -> None:
             "paths": ["C:/Users", "D:/"],
         }
     result = edit_object(initial)
-    print("Annulé." if result is None else json.dumps(result, ensure_ascii=False, indent=2))
+    if result is None:
+        print("Annulé.")
+    elif isinstance(result, dict):
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(result)
 
 
 if __name__ == "__main__":
-    main(sys.argv)
+    main([sys.argv, "--xarray"])

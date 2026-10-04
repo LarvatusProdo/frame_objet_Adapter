@@ -1,8 +1,8 @@
 # frame_dict — éditeur graphique d'objets Python
 
-Petit éditeur **tkinter** pour consulter et modifier des variables Python (`dict`, `list` imbriqués…) dans une arborescence, directement depuis un script ou à partir d'un fichier JSON.
+Petit éditeur **tkinter** pour consulter et modifier des variables Python (`dict`, `list` imbriqués…, `xarray.Dataset`) dans une arborescence, directement depuis un script ou à partir d'un fichier JSON ou NetCDF.
 
-Un seul fichier, aucune dépendance externe : uniquement la bibliothèque standard.
+Un seul fichier. Pour les `dict`, aucune dépendance externe : uniquement la bibliothèque standard. Les `xarray.Dataset` nécessitent `xarray` (avec `numpy` et `pandas`).
 
 ![Aperçu de l'éditeur](docs/apercu.png)
 
@@ -13,7 +13,8 @@ Un seul fichier, aucune dépendance externe : uniquement la bibliothèque standa
 - **Navigation au clavier** entre les cellules (`Tab`, flèches), pour enchaîner les modifications.
 - **Chemins de fichiers** : les chaînes qui ressemblent à un chemin (`C:/Users`, `./config`, `~/data.csv`…) sont détectées et reçoivent un bouton pour choisir un dossier ou un fichier.
 - **Annulation** des modifications (`Ctrl+Z`, jusqu'à 50 actions).
-- **Lecture / écriture JSON**.
+- **Lecture / écriture JSON**, et **NetCDF** pour les `xarray.Dataset`.
+- **Objets xarray** : coordonnées, variables et attributs d'un `xarray.Dataset` (voir [plus bas](#objets-xarray)).
 - **L'objet d'origine n'est jamais modifié** : l'éditeur travaille sur une copie et ne renvoie le résultat qu'après validation.
 - **Architecture extensible** : un nouveau type d'objet se prend en charge en écrivant un *adaptateur*, sans toucher à l'interface.
 
@@ -32,9 +33,15 @@ python frame_objet_Adapter.py
 
 # Ouvre un fichier JSON (qui doit contenir un objet au premier niveau)
 python frame_objet_Adapter.py config.json
+
+# Ouvre un fichier NetCDF (.nc, .nc4, .cdf) comme xarray.Dataset
+python frame_objet_Adapter.py donnees.nc
+
+# Ouvre un xarray.Dataset d'exemple
+python frame_objet_Adapter.py --xarray
 ```
 
-À la fermeture, l'objet validé est affiché au format JSON dans la console (ou `Annulé.`).
+À la fermeture, l'objet validé est affiché dans la console (au format JSON pour un `dict`), ou `Annulé.`.
 
 ### Depuis un script Python
 
@@ -74,6 +81,40 @@ Pour forcer une chaîne qui ressemble à un nombre, il faut l'entourer de guille
 
 Pour les **clés**, une clé `str` reste une `str` : le texte est pris tel quel, sans guillemets. Une clé d'un autre type (`int`, `tuple`…) est interprétée comme ci-dessus. Le renommage conserve l'ordre des clés.
 
+## Objets xarray
+
+Un `xarray.Dataset` s'édite comme un `dict` : `edit_object(ds)` retourne une copie modifiée, ou `None`.
+
+```
+Dimensions        time: 4, station: 3, niveau: 2        (lecture seule)
+Coordonnées
+  time            (time: 4) | 2024-01-01 00:00:00, …
+    attrs
+    [0]           2024-01-01 00:00:00
+Variables
+  debit           (time: 4) | 1.2, 3.4, 2.2, 0.9        variable à 1 dimension
+    attrs
+    [0]  time = 2024-01-01 00:00:00    1.2
+  temperature     (time: 4, station: 3) | 12.4, …       variable à 2 dimensions
+    [0]  time = 2024-01-01 00:00:00    12.4, 11.6, 13.9   une ligne par indice…
+      [0]  station = 'Tours'           12.4               …une cellule par colonne
+  cube            (time: 4, station: 3, niveau: 2) | …  3 dimensions ou plus : résumé seul
+  seuil           15.0                                  0 dimension : éditable sur la ligne
+Attributs
+```
+
+- Un Dataset peut contenir un nombre quelconque de variables. Les variables à **1 ou 2 dimensions** sont détaillées valeur par valeur ; celles à **3 dimensions ou plus** sont affichées sous la forme `nom (dim1: n1, dim2: n2, …) | valeurs…`, sans édition des valeurs.
+- Quand une dimension possède une coordonnée, sa valeur est rappelée devant chaque indice (`[0]  time = 2024-01-01`).
+- **Valeurs** : la saisie est convertie dans le type du tableau. Les dates se saisissent comme du texte (`2024-01-31`, `2024-01-31 12:00`), `nan` et `None` donnent `NaN` dans un tableau de réels. Un réel saisi dans un tableau d'entiers, ou une chaîne plus longue que les autres, élargit le type du tableau au lieu de tronquer la valeur. Modifier une coordonnée de dimension met à jour son index.
+- **Renommer** une variable (double-clic ou `F2` sur son nom). Renommer une coordonnée de dimension renomme aussi la dimension.
+- **Ajouter** une variable : sélectionner *Coordonnées* ou *Variables*, puis saisir un nom et une valeur : un scalaire (`3.5`) ou un tuple `(dimensions, données)`, ex. `('time', [1, 2, 3, 4])` ou `(('time', 'station'), [[…], …])`.
+- **Supprimer** une variable ou un attribut avec `Suppr`. La taille des tableaux ne peut pas être modifiée.
+- Les **attributs** (globaux et de chaque variable) s'éditent comme un `dict`.
+- Pour garder l'affichage réactif, seules les 50 premières lignes et les 20 premières colonnes d'un tableau sont affichées (`DatasetAdapter.MAX_ROWS`, `MAX_COLUMNS`). Une ligne `…` indique le nombre d'éléments masqués.
+- La lecture charge tout le fichier en mémoire. L'écriture utilise `Dataset.to_netcdf` : il faut `netCDF4`, `h5netcdf` ou `scipy` (NetCDF3 uniquement).
+
+Un `xarray.DataArray` peut être édité via `edit_object(da.to_dataset())`.
+
 ## Raccourcis
 
 **Dans l'arbre**
@@ -101,7 +142,7 @@ Pour les **clés**, une clé `str` reste une `str` : le texte est pris tel quel,
 | Raccourci | Effet |
 |---|---|
 | `Ctrl+Z` | Annuler la dernière modification |
-| `Ctrl+O` | Ouvrir un fichier JSON |
+| `Ctrl+O` | Ouvrir un fichier (JSON, NetCDF) |
 | `Ctrl+S` | Enregistrer sous… |
 
 Les valeurs `dict` et `list` ne sont pas éditables directement : on modifie leurs éléments, ou on utilise les boutons *Ajouter* / *Supprimer*.
@@ -123,6 +164,7 @@ Le bouton situé à droite de la valeur ouvre `askdirectory` ou `askopenfilename
 Node             description neutre d'une ligne de l'arbre (sans dépendance tkinter)
 ObjectAdapter    contrat entre un type d'objet et l'éditeur
 DictAdapter      implémentation pour dict (avec dict / list imbriqués)
+DatasetAdapter   implémentation pour xarray.Dataset (si xarray est installé)
 AdapterRegistry  choisit l'adaptateur selon le type de l'objet
 ObjectEditorApp  fenêtre tkinter, indépendante du type édité
 ```
@@ -153,8 +195,8 @@ class MonAdapter(ObjectAdapter):
         """Modifie en place la valeur située à `path` à partir du texte saisi."""
         ...
 
-    # Facultatif : can_add, requires_key, add_item, delete_item,
-    #              rename_key, read, write
+    # Facultatif : can_add, requires_key, add_hint, add_item, delete_item,
+    #              rename_key, read, write, expand_depth
 
 
 edit_object(mon_objet)
@@ -174,6 +216,11 @@ Les champs de `Node` pilotent l'affichage et les possibilités d'édition :
 | `renamable` | La clé est-elle modifiable ? |
 | `key_edit_text` | Texte proposé au renommage de la clé |
 | `path_kind` | `"dir"`, `"file"` ou `None` : affiche le bouton de choix de chemin |
+| `type_label` | Texte de la colonne *Type*, s'il diffère de `type_name` (ex. `float64`) |
+
+Les opérations modifient l'objet en place. Pour un type qui ne le permet pas, `set_value`, `rename_key`, `add_item` et `delete_item` peuvent retourner `NewRoot(nouvel_objet, chemin_à_sélectionner)` : l'éditeur remplace alors l'objet (l'annulation reste possible).
+
+L'extension d'un fichier ouvert (`Ctrl+O` ou ligne de commande) choisit l'adaptateur qui le lit, d'après les motifs de `file_types`.
 
 ### Personnaliser les couleurs
 
