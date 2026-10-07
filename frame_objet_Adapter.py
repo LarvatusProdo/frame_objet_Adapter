@@ -77,6 +77,9 @@ class Node:
     key_edit_text: str = ""  # texte proposé lors du renommage de la clé
     path_kind: str | None = None  # "dir" / "file" si la valeur ressemble à un chemin
     type_label: str = ""  # texte de la colonne « Type » (par défaut : type_name)
+    # > 0 : ligne « éléments non affichés » ; un bouton propose d'en afficher
+    # ``more`` de plus (voir ``ObjectAdapter.show_more``).
+    more: int = 0
 
 
 @dataclass(frozen=True)
@@ -174,6 +177,11 @@ class ObjectAdapter(ABC):
 
     def delete_item(self, obj: Any, path: Path) -> NewRoot | None:
         raise NotImplementedError("Suppression non supportée pour ce type.")
+
+    def show_more(self, obj: Any, path: Path) -> Path | None:
+        """Affiche davantage d'éléments à la place de la ligne ``path`` (un ``Node``
+        avec ``more > 0``). Retourne le chemin du premier élément ajouté."""
+        raise NotImplementedError("Affichage partiel non supporté pour ce type.")
 
     def read(self, filename: str) -> Any:
         raise NotImplementedError("Lecture de fichier non supportée.")
@@ -421,12 +429,11 @@ class DatasetAdapter(ObjectAdapter):
     - ``("dims",)`` : tailles des dimensions (lecture seule) ;
     - ``("coords", nom)`` / ``("data_vars", nom)`` : une variable. Ses enfants :
       ``(…, "attrs", clé)`` pour ses attributs, puis ses valeurs :
-      1 dimension : ``(…, i)`` un élément par ligne ;
-      2 dimensions : ``(…, i)`` une ligne par indice de la 1re dimension, et
-      ``(…, i, j)`` une cellule par indice de la 2de ;
       0 dimension : la valeur s'édite directement sur la ligne de la variable ;
-      3 dimensions ou plus : pas de valeurs détaillées, seulement le résumé
-      « (dimensions) | valeurs… » ;
+      n dimensions : un niveau de l'arbre par dimension. ``(…, i)`` est le
+      sous-tableau d'indice ``i`` de la 1re dimension, ``(…, i, j)`` celui
+      d'indice ``j`` de la 2de… jusqu'à la dernière dimension, dont chaque
+      élément ``(…, i, j, …, k)`` est une cellule éditable ;
     - ``("attrs", clé)`` : attributs globaux.
 
     Les attributs sont des ``dict`` : leur édition est confiée à ``DictAdapter``.
@@ -437,9 +444,13 @@ class DatasetAdapter(ObjectAdapter):
     GROUPS = {"coords": "Coordonnées", "data_vars": "Variables"}
     ATTRS = "attrs"
     MORE = "…"  # dernier élément du chemin d'une ligne « n éléments non affichés »
-    # Nombre maximal de lignes / de cellules par ligne affichées pour un tableau.
+    # Nombre de sous-tableaux / de cellules affichés d'un coup (une « page »).
     MAX_ROWS = 50
     MAX_COLUMNS = 20
+
+    def __init__(self) -> None:
+        # Chemin d'un tableau ou sous-tableau -> nombre de pages affichées (1 par défaut).
+        self._pages: dict[Path, int] = {}
 
     @classmethod
     def supports(cls, obj: Any) -> bool:
@@ -479,7 +490,7 @@ class DatasetAdapter(ObjectAdapter):
         var = ds.variables[path[1]]
         index = path[2:]
         nodes = [] if index else [self._attrs_node(var.attrs, path + (self.ATTRS,), "attrs")]
-        if 1 <= var.ndim <= 2:
+        if len(index) < var.ndim:
             nodes += self._element_nodes(ds, path, var)
         return nodes
 
@@ -527,25 +538,28 @@ class DatasetAdapter(ObjectAdapter):
         )
 
     def _element_nodes(self, ds: Any, path: Path, var: Any) -> list[Node]:
-        """Éléments (1-D), lignes (2-D) ou cellules d'une ligne (2-D) d'une variable."""
+        """Enfants du sous-tableau ``path`` selon la dimension suivante : des
+        sous-tableaux, ou des cellules s'il s'agit de la dernière dimension."""
         name, index = path[1], path[2:]
         dim = var.dims[len(index)]
         values = var.values[index]
         # Valeurs de la coordonnée de dimension, pour repérer chaque indice.
         coord = ds.variables[dim].values if dim in ds.coords and dim != name else None
-        limit = self.MAX_ROWS if not index else self.MAX_COLUMNS
-        is_row = var.ndim == 2 and not index
+        inner_dims = var.dims[len(index) + 1 :]  # dimensions des sous-tableaux
+        page = self._page_size(var, path)
+        limit = page * self._pages.get(path, 1)
         nodes = []
         for i in range(min(len(values), limit)):
             label = f"[{i}]"
             if coord is not None:
                 label += f"  {dim} = {_scalar_texts(coord[i])[0]}"
-            if is_row:
+            if inner_dims:
+                sizes = ", ".join(f"{d}: {s}" for d, s in zip(inner_dims, values[i].shape))
+                kind = "ligne" if len(inner_dims) == 1 else "bloc"
                 nodes.append(
                     Node(
                         path + (i,), label, _preview(values[i]), "list", "",
-                        is_container=True, editable=False,
-                        type_label=f"ligne ({var.dims[1]}: {len(values[i])})",
+                        is_container=True, editable=False, type_label=f"{kind} ({sizes})",
                     )
                 )
                 continue
@@ -557,10 +571,27 @@ class DatasetAdapter(ObjectAdapter):
                     path_kind=guess_path_kind(values[i]),
                 )
             )
-        if len(values) > limit:
-            hidden = f"{len(values) - limit} élément(s) non affiché(s)"
-            nodes.append(Node(path + (self.MORE,), self.MORE, hidden, "", "", False, False))
+        hidden = len(values) - limit
+        if hidden > 0:
+            nodes.append(
+                Node(
+                    path + (self.MORE,), self.MORE, f"{hidden} élément(s) non affiché(s)",
+                    "", "", False, False, more=min(page, hidden),
+                )
+            )
         return nodes
+
+    def _page_size(self, var: Any, path: Path) -> int:
+        """Taille d'une page : MAX_COLUMNS pour la dernière dimension, sinon MAX_ROWS."""
+        return self.MAX_COLUMNS if len(path) - 2 == var.ndim - 1 else self.MAX_ROWS
+
+    def show_more(self, ds: Any, path: Path) -> Path:
+        parent = path[:-1]  # path : (…, MORE)
+        if len(parent) < 2 or path[-1] != self.MORE:
+            raise ValueError("Cette ligne n'a pas d'éléments masqués.")
+        pages = self._pages.get(parent, 1)
+        self._pages[parent] = pages + 1
+        return parent + (self._page_size(ds.variables[parent[1]], parent) * pages,)
 
     # -- écriture ---------------------------------------------------------
     def set_value(self, ds: Any, path: Path, raw: str) -> NewRoot | None:
@@ -739,7 +770,11 @@ class ObjectEditor(ttk.Frame):
         self._styled_tags: set[str] = set()
         self._editor: _InlineEditor | None = None
         self._path_buttons: dict[str, ttk.Button] = {}  # iid -> bouton « parcourir »
+        self._more_buttons: dict[str, ttk.Button] = {}  # iid -> bouton « afficher plus »
         self._pending: set[str] = set()  # appels after_idle à annuler si détruit
+        self._unloaded: dict[str, str] = {}  # iid d'un nœud non chargé -> iid fictif
+        self._expanded: set[Path] = set()  # nœuds ouverts lors du dernier refresh
+        self._load_anyway: set[Path] = set()  # nœuds à charger même fermés
 
         self._build_tree()
         self._build_buttons()
@@ -819,6 +854,7 @@ class ObjectEditor(ttk.Frame):
         self._scrollbar.pack(side="right", fill="y")
 
         self.tree.bind("<Double-1>", self._on_double_click)
+        self.tree.bind("<<TreeviewOpen>>", self._on_tree_open)
         self.tree.bind("<Button-1>", lambda _e: self._finish_edit(commit=True), add=True)
         self.tree.bind("<Configure>", lambda _e: self._place_overlays(), add=True)
         # Ouverture/fermeture d'un nœud, redimensionnement d'une colonne : l'arbre
@@ -863,12 +899,19 @@ class ObjectEditor(ttk.Frame):
         if moved is not None:
             old, new = moved
             expanded = {new + p[len(old):] if p[: len(old)] == old else p for p in expanded}
-        for button in self._path_buttons.values():
+        # Nœuds à charger même fermés : ceux qui contiennent un nœud ouvert ou
+        # le nœud à sélectionner (pour que see() puisse l'afficher).
+        targets = expanded | ({select} if select is not None else set())
+        self._expanded = expanded
+        self._load_anyway = {p[:k] for p in targets for k in range(1, len(p))}
+        for button in (*self._path_buttons.values(), *self._more_buttons.values()):
             button.destroy()
         self._path_buttons.clear()
+        self._more_buttons.clear()
         self.tree.delete(*self.tree.get_children())
         self._nodes.clear()
-        self._populate("", (), expanded, expand_all)
+        self._unloaded.clear()
+        self._populate("", (), expand_all)
         iid = self._iid_for(select) if select is not None else None
         if iid is not None:
             self.tree.selection_set(iid)
@@ -876,9 +919,16 @@ class ObjectEditor(ttk.Frame):
             self.tree.see(iid)
         self._defer(self._place_overlays)
 
-    def _populate(self, parent_iid: str, path: Path, expanded: set[Path], expand_all: bool) -> None:
+    def _populate(self, parent_iid: str, path: Path, expand_all: bool = False) -> None:
+        """Insère les enfants de ``path``. Le contenu d'un nœud fermé n'est chargé
+        qu'à son ouverture (``_on_tree_open``) : un tableau à plusieurs dimensions
+        peut compter des dizaines de milliers d'éléments."""
         depth = self.adapter.expand_depth
         for node in self.adapter.children(self.obj, path):
+            is_open = node.is_container and (
+                node.path in self._expanded
+                or (expand_all and (depth is None or len(node.path) < depth))
+            )
             type_label = node.type_label or node.type_name
             if node.path_kind:
                 type_label += f" ({self.PATH_KIND_LABELS[node.path_kind]})"
@@ -889,8 +939,7 @@ class ObjectEditor(ttk.Frame):
                 image=self._icon(node.type_name),
                 values=(node.display, type_label),
                 tags=self._tags(node),
-                open=node.path in expanded
-                or (expand_all and (depth is None or len(node.path) < depth)),
+                open=is_open,
             )
             self._nodes[iid] = node
             if node.path_kind and node.editable:
@@ -901,8 +950,30 @@ class ObjectEditor(ttk.Frame):
                     takefocus=False,
                     command=lambda n=node: self._browse_path(n),
                 )
-            if node.is_container:
-                self._populate(iid, node.path, expanded, expand_all)
+            if node.more:
+                self._more_buttons[iid] = ttk.Button(
+                    self.tree,
+                    text=f"Afficher {node.more} de plus",
+                    style=self.PATH_BUTTON_STYLE,
+                    takefocus=False,
+                    # Différé : refresh() détruit ce bouton, pas pendant sa propre commande.
+                    command=lambda n=node: self._defer(lambda: self._show_more(n)),
+                )
+            if not node.is_container:
+                continue
+            if is_open or node.path in self._load_anyway:
+                self._populate(iid, node.path, expand_all)
+            else:
+                # Enfant fictif : fait apparaître l'indicateur d'ouverture.
+                self._unloaded[iid] = self.tree.insert(iid, "end")
+
+    def _on_tree_open(self, _event: tk.Event) -> None:
+        """Charge le contenu d'un nœud à sa première ouverture."""
+        iid = self.tree.focus()  # ttk donne le focus au nœud avant d'émettre l'événement
+        placeholder = self._unloaded.pop(iid, None)
+        if placeholder is not None:
+            self.tree.delete(placeholder)
+            self._populate(iid, self._nodes[iid].path)
 
     def _path_icon(self, kind: str) -> tk.PhotoImage:
         """Icône dessinée du bouton « parcourir » : dossier ou feuille."""
@@ -972,15 +1043,32 @@ class ObjectEditor(ttk.Frame):
         iid = self.tree.identify_row(event.y)
         if not iid or self.tree.identify_region(event.x, event.y) not in ("tree", "cell"):
             return None
+        node = self._nodes.get(iid)
+        if node is not None and node.more:
+            self._show_more(node)
+            return "break"
         column = KEY_COLUMN if self.tree.identify_column(event.x) == KEY_COLUMN else VALUE_COLUMN
         # "break" empêche le double-clic d'ouvrir/fermer le nœud en plus.
         return "break" if self._start_edit(iid, column) else None
 
     def _edit_selected(self, column: str) -> str:
-        selection = self.tree.selection()
-        if selection:
-            self._start_edit(selection[0], column)
+        node = self._selected()
+        if node is not None and node.more:
+            self._show_more(node)
+        elif node is not None:
+            self._start_edit(self.tree.selection()[0], column)
         return "break"
+
+    def _show_more(self, node: Node) -> None:
+        """Remplace la ligne « … » par les éléments suivants (bouton, double-clic, Entrée)."""
+        if not self.commit_edit():  # saisie en cours refusée
+            return
+        try:
+            select = self.adapter.show_more(self.obj, node.path)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Erreur", str(exc), parent=self)
+            return
+        self.refresh(select=select)
 
     def _start_edit(self, iid: str, column: str, text: str | None = None) -> bool:
         """Ouvre un champ de saisie sur la cellule ; False si non éditable."""
@@ -1040,6 +1128,14 @@ class ObjectEditor(ttk.Frame):
             x, y, width, height = bbox
             size = height - 2  # bouton carré
             button.place(x=x + width - size - 1, y=y + 1, width=size, height=size)
+        for iid, button in self._more_buttons.items():
+            bbox = self.tree.bbox(iid, VALUE_COLUMN)
+            if not bbox:
+                button.place_forget()
+                continue
+            x, y, width, height = bbox
+            button_width = min(button.winfo_reqwidth() + 8, width - 2)
+            button.place(x=x + width - button_width - 1, y=y + 1, width=button_width, height=height - 2)
 
         editor = self._editor
         if editor is None:
@@ -1274,7 +1370,8 @@ class ObjectEditor(ttk.Frame):
         """Annule la dernière modification."""
         if self._undo:
             self.obj = self._undo.pop()
-            self.adapter = self._registry.resolve(self.obj)  # l'objet a pu changer de type
+            if not self.adapter.supports(self.obj):  # l'objet a pu changer de type
+                self.adapter = self._registry.resolve(self.obj)
             self.refresh()
             self._changed()
 
@@ -1440,6 +1537,7 @@ def demo_dataset() -> Any:
             "temperature": (("time", "station"), rng.normal(12, 3, (4, 3)).round(1), {"units": "°C"}),
             "debit": ("time", [1.2, 3.4, 2.2, 0.9], {"units": "m3/s"}),
             "cube": (("time", "station", "niveau"), rng.random((4, 3, 2)).round(2)),
+            "test": ("aaa", [i for i in range(200)], {"units": "m3/s"}),
             "seuil": ((), 15.0),
         },
         coords={"time": time, "station": stations, "altitude": ("station", [60, 35, 170])},

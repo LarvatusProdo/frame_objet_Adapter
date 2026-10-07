@@ -140,12 +140,13 @@ Variables
   temperature     (time: 4, station: 3) | 12.4, …       variable à 2 dimensions
     [0]  time = 2024-01-01 00:00:00    12.4, 11.6, 13.9   une ligne par indice…
       [0]  station = 'Tours'           12.4               …une cellule par colonne
-  cube            (time: 4, station: 3, niveau: 2) | …  3 dimensions ou plus : résumé seul
+  cube            (time: 4, station: 3, niveau: 2) | …  3 dimensions : un niveau par dimension
   seuil           15.0                                  0 dimension : éditable sur la ligne
 Attributs
 ```
 
-- Un Dataset peut contenir un nombre quelconque de variables. Les variables à **1 ou 2 dimensions** sont détaillées valeur par valeur ; celles à **3 dimensions ou plus** sont affichées sous la forme `nom (dim1: n1, dim2: n2, …) | valeurs…`, sans édition des valeurs.
+- Un Dataset peut contenir un nombre quelconque de variables, avec un nombre quelconque de dimensions, toutes détaillées valeur par valeur. Chaque dimension forme un niveau de l'arbre : pour `cube (time, station, niveau)`, `[1]` est le bloc `time = 2024-01-02` (*bloc (station: 3, niveau: 2)*), `[1] > [2]` la ligne `station = 'Lyon'` (*ligne (niveau: 2)*), et ses enfants les cellules éditables. Les éléments s'affichent par pages de 50 sous-tableaux ou de 20 cellules (`MAX_ROWS`, `MAX_COLUMNS`) : au-delà, une ligne `…  n élément(s) non affiché(s)` porte un bouton **Afficher 20 de plus** (également accessible par double-clic ou `Entrée`) qui affiche la page suivante à sa place.
+- Le contenu d'un nœud n'est chargé qu'à sa première ouverture : même un grand tableau s'affiche instantanément.
 - Quand une dimension possède une coordonnée, sa valeur est rappelée devant chaque indice (`[0]  time = 2024-01-01`).
 - **Valeurs** : la saisie est convertie dans le type du tableau. Les dates se saisissent comme du texte (`2024-01-31`, `2024-01-31 12:00`), `nan` et `None` donnent `NaN` dans un tableau de réels. Un réel saisi dans un tableau d'entiers, ou une chaîne plus longue que les autres, élargit le type du tableau au lieu de tronquer la valeur. Modifier une coordonnée de dimension met à jour son index.
 - **Renommer** une variable (double-clic ou `F2` sur son nom). Renommer une coordonnée de dimension renomme aussi la dimension.
@@ -240,7 +241,7 @@ class MonAdapter(ObjectAdapter):
         ...
 
     # Facultatif : can_add, requires_key, add_hint, add_item, delete_item,
-    #              rename_key, read, write, expand_depth
+    #              rename_key, show_more, read, write, expand_depth
 
 
 edit_object(mon_objet)
@@ -261,6 +262,7 @@ Les champs de `Node` pilotent l'affichage et les possibilités d'édition :
 | `key_edit_text` | Texte proposé au renommage de la clé |
 | `path_kind` | `"dir"`, `"file"` ou `None` : affiche le bouton de choix de chemin |
 | `type_label` | Texte de la colonne *Type*, s'il diffère de `type_name` (ex. `float64`) |
+| `more` | Si > 0 : ligne « éléments non affichés », avec un bouton qui appelle `show_more(obj, path)` pour en afficher `more` de plus |
 
 Les opérations modifient l'objet en place. Pour un type qui ne le permet pas, `set_value`, `rename_key`, `add_item` et `delete_item` peuvent retourner `NewRoot(nouvel_objet, chemin_à_sélectionner)` : l'éditeur remplace alors l'objet (l'annulation reste possible).
 
