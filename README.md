@@ -63,6 +63,48 @@ else:
 
 `edit_object` ouvre la fenêtre, attend sa fermeture puis retourne une **copie modifiée** de l'objet, ou `None` si l'utilisateur annule.
 
+### Dans une application tkinter existante
+
+Une application tkinter ne doit avoir qu'une seule fenêtre racine (`tk.Tk`). L'éditeur s'intègre donc de deux façons :
+
+**Boîte de dialogue modale** : on passe un widget de l'application en `parent`.
+
+```python
+resultat = edit_object(config, title="Configuration", parent=root)
+```
+
+**Widget intégré** : `ObjectEditor` est un `ttk.Frame` à placer avec `pack` ou `grid`, comme n'importe quel widget.
+
+```python
+from frame_objet_Adapter import ObjectEditor
+
+editeur = ObjectEditor(
+    cadre, config,
+    on_validate=lambda obj: enregistrer(obj),  # facultatif : ajoute un bouton « Valider »
+    on_cancel=lambda: editeur.set_object(config),  # facultatif : ajoute un bouton « Annuler »
+)
+editeur.pack(fill="both", expand=True)
+editeur.bind("<<ObjectChanged>>", lambda e: print("modifié :", editeur.obj))
+editeur.bind_shortcuts(root)  # Ctrl+O / Ctrl+S / Ctrl+Z sur toute la fenêtre (facultatif)
+```
+
+| Méthode / attribut | Rôle |
+|---|---|
+| `obj` | Copie de l'objet en cours d'édition |
+| `set_object(obj)` | Charge un autre objet (et vide l'historique d'annulation) |
+| `validate()` / `cancel()` | Applique la saisie en cours, puis appelle `on_validate(obj)` / `on_cancel()` |
+| `commit_edit()` | Applique la saisie en cours ; `False` si elle est refusée |
+| `undo()`, `open_file()`, `save_file()` | Actions utilisables depuis les menus de l'application hôte |
+| `<<ObjectChanged>>` | Événement émis après chaque modification faite par l'utilisateur |
+
+Le widget ne modifie ni le titre, ni le menu, ni les raccourcis de la fenêtre hôte, et utilise ses propres styles ttk (`ObjectEditor.Treeview`) : les `Treeview` de l'application ne sont pas affectés.
+
+`exemple_integration.py` montre les deux modes dans un petit gestionnaire de profils :
+
+```bash
+python exemple_integration.py
+```
+
 ## Saisie des valeurs
 
 Le texte saisi est interprété comme un littéral Python (`ast.literal_eval`) :
@@ -166,7 +208,9 @@ ObjectAdapter    contrat entre un type d'objet et l'éditeur
 DictAdapter      implémentation pour dict (avec dict / list imbriqués)
 DatasetAdapter   implémentation pour xarray.Dataset (si xarray est installé)
 AdapterRegistry  choisit l'adaptateur selon le type de l'objet
-ObjectEditorApp  fenêtre tkinter, indépendante du type édité
+ObjectEditor     widget tkinter (ttk.Frame), indépendant du type édité
+ObjectEditorApp  application autonome (tk.Tk) contenant un ObjectEditor
+ObjectEditorDialog  boîte de dialogue modale (tk.Toplevel) contenant un ObjectEditor
 ```
 
 L'interface ne manipule jamais l'objet directement : elle demande à l'adaptateur la liste des nœuds (`children`) et lui délègue toutes les modifications (`set_value`, `rename_key`, `add_item`, `delete_item`).
@@ -224,19 +268,18 @@ L'extension d'un fichier ouvert (`Ctrl+O` ou ligne de commande) choisit l'adapta
 
 ### Personnaliser les couleurs
 
-Les couleurs sont des attributs de classe d'`ObjectEditorApp` : `TYPE_COLORS`, `CONTAINER_BACKGROUNDS`, `SELECTION_BACKGROUND`… On peut les modifier dans une sous-classe :
+Les couleurs sont des attributs de classe d'`ObjectEditor` : `TYPE_COLORS`, `CONTAINER_BACKGROUNDS`, `SELECTION_BACKGROUND`… On peut les modifier dans une sous-classe :
 
 ```python
-from frame_objet_Adapter import ObjectEditorApp
+from frame_objet_Adapter import ObjectEditor
 
 
-class MonEditeur(ObjectEditorApp):
-    TYPE_COLORS = {**ObjectEditorApp.TYPE_COLORS, "str": "#006400", "ndarray": "#8b008b"}
+class MonEditeur(ObjectEditor):
+    TYPE_COLORS = {**ObjectEditor.TYPE_COLORS, "str": "#006400", "ndarray": "#8b008b"}
 
 
-app = MonEditeur({"a": 1, "b": "texte"}, title="Éditeur personnalisé")
-app.mainloop()
-print(app.result)  # None si annulé
+editeur = MonEditeur(cadre, {"a": 1, "b": "texte"})
+editeur.pack(fill="both", expand=True)
 ```
 
 ## Limites connues

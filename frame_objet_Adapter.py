@@ -7,7 +7,10 @@ Architecture
 - ``DictAdapter`` : implémentation pour ``dict`` (avec ``dict`` et ``list`` imbriqués).
 - ``DatasetAdapter`` : implémentation pour ``xarray.Dataset`` (si xarray est installé).
 - ``AdapterRegistry`` : choisit automatiquement l'adaptateur selon le type de l'objet.
-- ``ObjectEditorApp`` : fenêtre tkinter, indépendante du type édité.
+- ``ObjectEditor`` : widget tkinter (``ttk.Frame``), indépendant du type édité,
+  intégrable dans n'importe quelle application.
+- ``ObjectEditorApp`` / ``ObjectEditorDialog`` : fenêtres prêtes à l'emploi
+  (application autonome / boîte de dialogue modale) autour d'``ObjectEditor``.
 
 Pour supporter un nouveau type, il suffit d'écrire un adaptateur et de le
 déclarer avec ``@registry.register``. La GUI ne change pas.
@@ -17,7 +20,15 @@ Usage
     python frame_objet_Adapter.py [fichier.json | fichier.nc | --xarray]
 
     from frame_objet_Adapter import edit_object
-    nouveau = edit_object({"a": 1})   # None si l'utilisateur annule
+    nouveau = edit_object({"a": 1})                # application autonome
+    nouveau = edit_object({"a": 1}, parent=root)   # dialogue modal dans une appli tkinter
+    # None si l'utilisateur annule
+
+    from frame_objet_Adapter import ObjectEditor
+    editeur = ObjectEditor(cadre, {"a": 1})        # widget à placer avec pack/grid
+    editeur.bind("<<ObjectChanged>>", lambda e: print(editeur.obj))
+
+Voir ``exemple_integration.py`` pour une application complète.
 """
 
 from __future__ import annotations
@@ -658,8 +669,20 @@ class _InlineEditor:
     node: Node
 
 
-class ObjectEditorApp(tk.Tk):
-    """Fenêtre d'édition générique, pilotée par un ``ObjectAdapter``."""
+class ObjectEditor(ttk.Frame):
+    """Widget d'édition générique, piloté par un ``ObjectAdapter``.
+
+    C'est un simple ``ttk.Frame`` : il se place dans n'importe quelle fenêtre
+    (``pack``/``grid``) sans toucher à la fenêtre hôte (titre, menu, raccourcis,
+    styles ttk globaux). L'objet édité est une copie, lisible dans ``obj``.
+
+    - ``on_validate(obj)`` / ``on_cancel()`` : si fournis, ajoute les boutons
+      « Valider » / « Annuler » qui appellent ces fonctions.
+    - L'événement virtuel ``<<ObjectChanged>>`` est émis après chaque
+      modification faite par l'utilisateur (édition, ajout, annulation…).
+    - ``bind_shortcuts(fenêtre)`` active Ctrl+O, Ctrl+S et Ctrl+Z sur la fenêtre
+      choisie (seul Ctrl+Z est actif par défaut, quand l'arbre a le focus).
+    """
 
     UNDO_LIMIT = 50
 
@@ -692,21 +715,23 @@ class ObjectEditorApp(tk.Tk):
     ICON_SIZE = 12
     PATH_KIND_LABELS = {"dir": "dossier", "file": "fichier"}
 
+    # Styles ttk propres à l'éditeur : ceux de l'application hôte restent intacts.
+    TREE_STYLE = "ObjectEditor.Treeview"
+    PATH_BUTTON_STYLE = "ObjectEditor.Path.TButton"
+
     def __init__(
         self,
+        master: tk.Misc | None,
         obj: Any,
         adapter_registry: AdapterRegistry = registry,
-        title: str = "Éditeur d'objet",
+        on_validate: Callable[[Any], None] | None = None,
+        on_cancel: Callable[[], None] | None = None,
+        **frame_options: Any,
     ) -> None:
-        super().__init__()
-        self.title(title)
-        self.geometry("760x500")
-        self.minsize(520, 320)
-
+        super().__init__(master, **frame_options)
         self._registry = adapter_registry
-        self.obj = copy.deepcopy(obj)  # on ne modifie jamais l'original
-        self.adapter = adapter_registry.resolve(self.obj)
-        self.result: Any | None = None
+        self._on_validate_cb = on_validate
+        self._on_cancel_cb = on_cancel
 
         self._undo: deque[Any] = deque(maxlen=self.UNDO_LIMIT)
         self._nodes: dict[str, Node] = {}
@@ -714,39 +739,61 @@ class ObjectEditorApp(tk.Tk):
         self._styled_tags: set[str] = set()
         self._editor: _InlineEditor | None = None
         self._path_buttons: dict[str, ttk.Button] = {}  # iid -> bouton « parcourir »
+        self._pending: set[str] = set()  # appels after_idle à annuler si détruit
 
-        self._build_menu()
         self._build_tree()
         self._build_buttons()
-        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self.tree.bind("<Control-z>", lambda _e: self.undo())
+        self.set_object(obj)
+
+    # -- API publique -----------------------------------------------------
+    def set_object(self, obj: Any) -> None:
+        """Remplace l'objet édité (par une copie) et vide l'historique."""
+        self._finish_edit(commit=False)
+        self.obj = copy.deepcopy(obj)  # on ne modifie jamais l'original
+        self.adapter = self._registry.resolve(self.obj)
+        self._undo.clear()
         self.refresh(expand_all=True)
 
-    # -- construction -----------------------------------------------------
-    def _build_menu(self) -> None:
-        menubar = tk.Menu(self)
-        file_menu = tk.Menu(menubar, tearoff=False)
-        file_menu.add_command(label="Ouvrir…", command=self._on_open, accelerator="Ctrl+O")
-        file_menu.add_command(label="Enregistrer sous…", command=self._on_save, accelerator="Ctrl+S")
-        file_menu.add_separator()
-        file_menu.add_command(label="Valider et fermer", command=self._on_validate)
-        file_menu.add_command(label="Annuler et fermer", command=self._on_cancel)
-        menubar.add_cascade(label="Fichier", menu=file_menu)
-        self.config(menu=menubar)
-        self.bind("<Control-o>", lambda _e: self._on_open())
-        self.bind("<Control-s>", lambda _e: self._on_save())
-        self.bind("<Control-z>", lambda _e: self._on_undo())
+    def bind_shortcuts(self, widget: tk.Misc) -> None:
+        """Associe Ctrl+O / Ctrl+S / Ctrl+Z de ``widget`` (en général la fenêtre) à l'éditeur."""
+        widget.bind("<Control-o>", lambda _e: self.open_file())
+        widget.bind("<Control-s>", lambda _e: self.save_file())
+        widget.bind("<Control-z>", lambda _e: self.undo())
+        self.tree.unbind("<Control-z>")  # sinon Ctrl+Z annulerait deux actions
 
+    def destroy(self) -> None:
+        # Un appel différé exécuté après destruction déclencherait une erreur Tcl.
+        for after_id in self._pending:
+            self.after_cancel(after_id)
+        self._pending.clear()
+        super().destroy()
+
+    def _defer(self, func: Callable[[], None]) -> None:
+        """``after_idle`` annulé automatiquement si le widget est détruit avant."""
+
+        def run() -> None:
+            self._pending.discard(after_id)
+            func()
+
+        after_id = self.after_idle(run)
+        self._pending.add(after_id)
+
+    def _changed(self) -> None:
+        self.event_generate("<<ObjectChanged>>")
+
+    # -- construction -----------------------------------------------------
     def _build_style(self) -> None:
         style = ttk.Style(self)
         default_font = tkfont.nametofont("TkDefaultFont")
         self._bold_font = default_font.copy()
         self._bold_font.configure(weight="bold")
-        style.configure("Treeview", rowheight=int(default_font.metrics("linespace") * 1.6))
-        style.configure("Treeview.Heading", font=self._bold_font)
-        style.configure("Path.TButton", padding=0)
+        style.configure(self.TREE_STYLE, rowheight=int(default_font.metrics("linespace") * 1.6))
+        style.configure(f"{self.TREE_STYLE}.Heading", font=self._bold_font)
+        style.configure(self.PATH_BUTTON_STYLE, padding=0)
         # Garde la ligne sélectionnée lisible malgré les couleurs des tags.
         style.map(
-            "Treeview",
+            self.TREE_STYLE,
             background=[("selected", self.SELECTION_BACKGROUND)],
             foreground=[("selected", "white")],
         )
@@ -754,9 +801,11 @@ class ObjectEditorApp(tk.Tk):
     def _build_tree(self) -> None:
         self._build_style()
         frame = ttk.Frame(self)
-        frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        frame.pack(fill="both", expand=True, pady=(0, 4))
 
-        self.tree = ttk.Treeview(frame, columns=("value", "type"), selectmode="browse")
+        self.tree = ttk.Treeview(
+            frame, columns=("value", "type"), selectmode="browse", style=self.TREE_STYLE
+        )
         self.tree.heading("#0", text="Clé")
         self.tree.heading("value", text="Valeur")
         self.tree.heading("type", text="Type")
@@ -775,7 +824,7 @@ class ObjectEditorApp(tk.Tk):
         # Ouverture/fermeture d'un nœud, redimensionnement d'une colonne : l'arbre
         # n'est à jour qu'après le traitement de l'événement, d'où after_idle.
         for sequence in ("<<TreeviewOpen>>", "<<TreeviewClose>>", "<B1-Motion>", "<ButtonRelease-1>"):
-            self.tree.bind(sequence, lambda _e: self.after_idle(self._place_overlays), add=True)
+            self.tree.bind(sequence, lambda _e: self._defer(self._place_overlays), add=True)
         self.tree.bind("<Return>", lambda _e: self._edit_selected(VALUE_COLUMN))
         self.tree.bind("<F2>", lambda _e: self._edit_selected(KEY_COLUMN))
         self.tree.bind("<Tab>", lambda _e: self._tab_from_tree(+1))
@@ -784,12 +833,14 @@ class ObjectEditorApp(tk.Tk):
 
     def _build_buttons(self) -> None:
         bar = ttk.Frame(self)
-        bar.pack(fill="x", padx=8, pady=(4, 8))
+        bar.pack(fill="x", pady=(4, 0))
         ttk.Button(bar, text="Ajouter", command=self._on_add).pack(side="left")
         ttk.Button(bar, text="Supprimer", command=self._on_delete).pack(side="left", padx=4)
-        ttk.Button(bar, text="Annuler l'action", command=self._on_undo).pack(side="left")
-        ttk.Button(bar, text="Valider", command=self._on_validate).pack(side="right")
-        ttk.Button(bar, text="Annuler", command=self._on_cancel).pack(side="right", padx=4)
+        ttk.Button(bar, text="Annuler l'action", command=self.undo).pack(side="left")
+        if self._on_validate_cb is not None:
+            ttk.Button(bar, text="Valider", command=self.validate).pack(side="right")
+        if self._on_cancel_cb is not None:
+            ttk.Button(bar, text="Annuler", command=self.cancel).pack(side="right", padx=4)
 
     # -- affichage --------------------------------------------------------
     def refresh(
@@ -823,7 +874,7 @@ class ObjectEditorApp(tk.Tk):
             self.tree.selection_set(iid)
             self.tree.focus(iid)
             self.tree.see(iid)
-        self.after_idle(self._place_overlays)
+        self._defer(self._place_overlays)
 
     def _populate(self, parent_iid: str, path: Path, expanded: set[Path], expand_all: bool) -> None:
         depth = self.adapter.expand_depth
@@ -846,7 +897,7 @@ class ObjectEditorApp(tk.Tk):
                 self._path_buttons[iid] = ttk.Button(
                     self.tree,
                     image=self._path_icon(node.path_kind),
-                    style="Path.TButton",
+                    style=self.PATH_BUTTON_STYLE,
                     takefocus=False,
                     command=lambda n=node: self._browse_path(n),
                 )
@@ -966,7 +1017,7 @@ class ObjectEditorApp(tk.Tk):
         entry.bind("<Shift-Tab>", lambda _e: self._move_edit(-1))
         entry.bind("<Down>", lambda _e: self._move_edit(+1, same_column=True))
         entry.bind("<Up>", lambda _e: self._move_edit(-1, same_column=True))
-        entry.bind("<FocusOut>", lambda _e: self.after_idle(self._on_editor_focus_out))
+        entry.bind("<FocusOut>", lambda _e: self._defer(self._on_editor_focus_out))
         self._editor = _InlineEditor(entry, iid, column, node)
         self.update_idletasks()  # bbox n'est fiable qu'une fois l'arbre affiché
         self._place_overlays()
@@ -977,8 +1028,9 @@ class ObjectEditorApp(tk.Tk):
         """(Re)positionne les widgets superposés à l'arbre : boutons « parcourir »
         et champ de saisie (après défilement, redimensionnement, ouverture…)."""
         try:
-            self.tree.winfo_exists()
-        except tk.TclError:  # appel différé arrivé après la fermeture de la fenêtre
+            if not self.tree.winfo_exists():
+                return
+        except tk.TclError:  # appel arrivé après la fermeture de l'application
             return
         for iid, button in self._path_buttons.items():
             bbox = self.tree.bbox(iid, VALUE_COLUMN)
@@ -1044,7 +1096,7 @@ class ObjectEditorApp(tk.Tk):
 
     def _indent(self) -> int:
         try:
-            return int(ttk.Style(self).lookup("Treeview", "indent") or 20)
+            return int(ttk.Style(self).lookup(self.TREE_STYLE, "indent") or 20)
         except (ValueError, tk.TclError):
             return 20
 
@@ -1191,6 +1243,7 @@ class ObjectEditorApp(tk.Tk):
             new_path = None
         moved = (origin, new_path) if origin is not None and new_path is not None else None
         self.refresh(select=new_path, moved=moved)
+        self._changed()
         return True
 
     # -- actions ----------------------------------------------------------
@@ -1217,12 +1270,16 @@ class ObjectEditorApp(tk.Tk):
         if node is not None:
             self._mutate(lambda: self.adapter.delete_item(self.obj, node.path))
 
-    def _on_undo(self) -> None:
+    def undo(self) -> None:
+        """Annule la dernière modification."""
         if self._undo:
             self.obj = self._undo.pop()
+            self.adapter = self._registry.resolve(self.obj)  # l'objet a pu changer de type
             self.refresh()
+            self._changed()
 
-    def _on_open(self) -> None:
+    def open_file(self) -> None:
+        """Remplace l'objet édité par le contenu d'un fichier choisi par l'utilisateur."""
         filename = filedialog.askopenfilename(
             filetypes=self._registry.file_types(first=self.adapter), parent=self
         )
@@ -1238,8 +1295,10 @@ class ObjectEditorApp(tk.Tk):
         self.obj = new_obj
         self.adapter = self._registry.resolve(self.obj)
         self.refresh(expand_all=True)
+        self._changed()
 
-    def _on_save(self) -> None:
+    def save_file(self) -> None:
+        """Enregistre l'objet édité dans un fichier choisi par l'utilisateur."""
         pattern = self.adapter.file_types[0][1].split()[0]  # ex : "*.json"
         filename = filedialog.asksaveasfilename(
             filetypes=self.adapter.file_types,
@@ -1253,8 +1312,61 @@ class ObjectEditorApp(tk.Tk):
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Erreur d'écriture", str(exc), parent=self)
 
-    def _on_validate(self) -> None:
-        self.result = self.obj
+    def commit_edit(self) -> bool:
+        """Applique la saisie en cours, s'il y en a une ; False si elle est refusée."""
+        if self._editor is None:
+            return True
+        return self._finish_edit(commit=True) is not None
+
+    def validate(self) -> None:
+        """Applique la saisie en cours puis transmet l'objet à ``on_validate``."""
+        if self.commit_edit() and self._on_validate_cb is not None:
+            self._on_validate_cb(self.obj)
+
+    def cancel(self) -> None:
+        self._finish_edit(commit=False)
+        if self._on_cancel_cb is not None:
+            self._on_cancel_cb()
+
+
+# ---------------------------------------------------------------------------
+# Fenêtres prêtes à l'emploi
+# ---------------------------------------------------------------------------
+class _EditorWindow:
+    """Fenêtre (``tk.Tk`` ou ``tk.Toplevel``) contenant un ``ObjectEditor``,
+    un menu « Fichier » et les boutons Valider / Annuler.
+
+    Après fermeture, ``result`` contient l'objet modifié, ou None si annulation.
+    """
+
+    def _build_window(self, obj: Any, adapter_registry: AdapterRegistry, title: str) -> None:
+        self.title(title)
+        self.geometry("760x500")
+        self.minsize(520, 320)
+        self.result: Any | None = None
+        self.editor = ObjectEditor(
+            self, obj, adapter_registry, on_validate=self._on_validate, on_cancel=self._on_cancel
+        )
+        self.editor.pack(fill="both", expand=True, padx=8, pady=8)
+        self.editor.bind_shortcuts(self)
+        self._build_menu()
+        self.protocol("WM_DELETE_WINDOW", self.editor.cancel)
+
+    def _build_menu(self) -> None:
+        menubar = tk.Menu(self)
+        file_menu = tk.Menu(menubar, tearoff=False)
+        file_menu.add_command(label="Ouvrir…", command=self.editor.open_file, accelerator="Ctrl+O")
+        file_menu.add_command(
+            label="Enregistrer sous…", command=self.editor.save_file, accelerator="Ctrl+S"
+        )
+        file_menu.add_separator()
+        file_menu.add_command(label="Valider et fermer", command=self.editor.validate)
+        file_menu.add_command(label="Annuler et fermer", command=self.editor.cancel)
+        menubar.add_cascade(label="Fichier", menu=file_menu)
+        self.config(menu=menubar)
+
+    def _on_validate(self, obj: Any) -> None:
+        self.result = obj
         self.destroy()
 
     def _on_cancel(self) -> None:
@@ -1262,11 +1374,56 @@ class ObjectEditorApp(tk.Tk):
         self.destroy()
 
 
+class ObjectEditorApp(_EditorWindow, tk.Tk):
+    """Application autonome (fenêtre racine). À lancer avec ``mainloop()``."""
+
+    def __init__(
+        self,
+        obj: Any,
+        adapter_registry: AdapterRegistry = registry,
+        title: str = "Éditeur d'objet",
+    ) -> None:
+        tk.Tk.__init__(self)
+        self._build_window(obj, adapter_registry, title)
+
+
+class ObjectEditorDialog(_EditorWindow, tk.Toplevel):
+    """Boîte de dialogue modale, à ouvrir depuis une application tkinter existante."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        obj: Any,
+        adapter_registry: AdapterRegistry = registry,
+        title: str = "Éditeur d'objet",
+    ) -> None:
+        tk.Toplevel.__init__(self, parent)
+        self._build_window(obj, adapter_registry, title)
+        self.transient(parent.winfo_toplevel())
+
+    def show(self) -> Any | None:
+        """Bloque jusqu'à la fermeture et retourne l'objet modifié (None si annulation)."""
+        self.wait_visibility()
+        self.grab_set()
+        self.editor.tree.focus_set()
+        self.wait_window()
+        return self.result
+
+
 # ---------------------------------------------------------------------------
 # API publique
 # ---------------------------------------------------------------------------
-def edit_object(obj: Any, title: str = "Éditeur d'objet") -> Any | None:
-    """Ouvre l'éditeur et retourne l'objet modifié (None si annulation)."""
+def edit_object(
+    obj: Any, title: str = "Éditeur d'objet", parent: tk.Misc | None = None
+) -> Any | None:
+    """Ouvre l'éditeur et retourne l'objet modifié (None si annulation).
+
+    Sans ``parent``, crée sa propre application tkinter. Depuis une application
+    tkinter existante, passer un de ses widgets en ``parent`` : l'éditeur
+    s'ouvre alors en boîte de dialogue modale.
+    """
+    if parent is not None:
+        return ObjectEditorDialog(parent, obj, title=title).show()
     app = ObjectEditorApp(obj, title=title)
     app.mainloop()
     return app.result
